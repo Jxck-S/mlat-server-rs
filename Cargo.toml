@@ -1,0 +1,29 @@
+[package]
+name = "mlat-server"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "mlat_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mlat-server"
+path = "src/main.rs"
+
+[dependencies]
+nalgebra = "0.33"
+rand = "0.8"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bytes = "1"
+clap = { version = "4.4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
+hex = "0.4"
+chrono = "0.4.43"
+
+[dev-dependencies]
+criterion = "0.5"
+hex = "0.4"

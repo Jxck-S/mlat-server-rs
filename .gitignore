@@ -1,0 +1,39 @@
+# Cargo
+/target
+
+# IDE / AI (do not commit)
+.gemini/
+.cursor/
+.vscode/
+
+# Work directories (runtime stats, debug output)
+.work/
+.work-rust/
+.work-python/
+
+# Docs and internal (do not commit)
+.github/
+/docs/
+/mlat-proxy/
+CONCURRENCY_STRATEGY.md
+IMPLEMENTATION_GUIDE.md
+
+# Python (venv for reference server; do not commit)
+.venv/
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+*.egg-info/
+.eggs/
+
+# Tools, tests, and test data (do not commit)
+/tools/
+/tests/
+/test_data/
+
+# Test / verification artifacts (optional)
+hex_candidates.txt
+
+# OS
+.DS_Store
