@@ -37,9 +37,9 @@ Or run the built binary:
 | `--motd TEXT` | Message of the day sent to clients (default: empty). |
 | `--write-csv FILE` | Append CSV results to a file. Can be repeated. |
 | `--basestation-connect HOST:PORT` | Connect and send Basestation-format results. Can be repeated. |
-| `--basestation-listen ADDR` | Listen on `[host:]port` and send Basestation-format to connecting clients. Can be repeated. |
+| `--basestation-listen ADDR` | Listen on `host:port` and send Basestation-format to connecting clients. Can be repeated. Use a full address, e.g. `127.0.0.1:30003` (port alone is invalid). |
 | `--filtered-basestation-connect HOST:PORT` | Same as above, filtered. Can be repeated. |
-| `--filtered-basestation-listen ADDR` | Same as above (listen), filtered. Can be repeated. |
+| `--filtered-basestation-listen ADDR` | Same as above (listen), filtered. Use `host:port`, e.g. `127.0.0.1:30003`. Can be repeated. |
 | `--work-dir DIR` | Directory for debug/stats and blacklist. |
 | `--check-leaks` | (Reserved; no-op in Rust.) |
 | `--dump-pseudorange FILE` | Dump pseudorange data as JSON to a file. |
@@ -54,6 +54,7 @@ Or run the built binary:
 ./target/release/mlat-server \
   --client-listen 0.0.0.0:4100 \
   --work-dir .work \
+  --basestation-listen 127.0.0.1:30003 \
   --basestation-connect 127.0.0.1:30005 \
   --write-csv results.csv \
   --verbose
@@ -85,7 +86,7 @@ Clients send timestamped Mode S messages and sync messages. The server uses them
 | Component | Parameter | Direction | Description |
 |-----------|-----------|-----------|-------------|
 | **Basestation connect** | `--basestation-connect HOST:PORT` | Server → remote | Server connects out to the given host:port and streams Basestation-format (SBS) lines for each MLAT result. |
-| **Basestation listen** | `--basestation-listen ADDR` | Remote → server, then server → client | Server listens on `[host:]port`; when a client connects, the server streams SBS to that client. |
+| **Basestation listen** | `--basestation-listen ADDR` | Remote → server, then server → client | Server listens on `host:port` (e.g. `127.0.0.1:30003`); when a client connects, the server streams SBS to that client. |
 | **Filtered Basestation** | `--filtered-basestation-connect`, `--filtered-basestation-listen` | Same as above | Same as above but filtered (e.g. by aircraft or region). |
 | **CSV** | `--write-csv FILE` | Server → file | Append one CSV row per MLAT result to the given file(s). |
 | **Work directory** | `--work-dir DIR` | Server → files | Writes `sync.json`, `clients.json`, `aircraft.json` (and handshakes.log) for debugging/stats. |
@@ -174,8 +175,8 @@ For local development and testing you can pipe this server’s Basestation (SBS)
 
 Typical flow:
 
-1. Run mlat-server with a Basestation listen port, e.g.  
-   `--basestation-listen 30003`
+1. Run mlat-server with a Basestation listen address (must be `host:port`), e.g.  
+   `--basestation-listen 127.0.0.1:30003`
 2. Run readsb so it connects to that SBS stream, e.g.  
    `--net-connector 127.0.0.1,30003,sbs_in` (plus your usual readsb options: `--net`, `--write-json`, etc.).
 3. Install and run tar1090 pointing at the same data directory readsb uses; open the tar1090 page in a browser to see MLAT and ADS-B traffic on the map.

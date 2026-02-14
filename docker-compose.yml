@@ -25,6 +25,6 @@ services:
       - --client-listen
       - "31090"
       - --filtered-basestation-listen
-      - "30104"
+      - "0.0.0.0:30104"
       - --work-dir
       - /run/mlat-server-rs

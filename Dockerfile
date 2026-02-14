@@ -40,4 +40,4 @@ USER mlat
 WORKDIR /run/mlat-server-rs
 
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
-CMD ["--client-listen", "31090", "--filtered-basestation-listen", "30104", "--work-dir", "/run/mlat-server-rs"]
+CMD ["--client-listen", "31090", "--filtered-basestation-listen", "0.0.0.0:30104", "--work-dir", "/run/mlat-server-rs"]
