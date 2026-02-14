@@ -117,7 +117,7 @@ impl OutputHandler for SbsOutput {
 
         // ident and aog empty per Python TEMPLATE
         let sbs = format!(
-            "MSG,3,1,1,{:06X},1,{},{},{},{},{},{},{},,{:.6},{:.6},{},{},{},{},,\n",
+            "MSG,3,1,1,{:06X},1,{},{},{},{},{},{},{},,{:.6},{:.6},{},{},{},{},{},{},{},,\n",
             result.icao,
             rcv_date,
             rcv_time,
@@ -133,6 +133,8 @@ impl OutputHandler for SbsOutput {
             squawk,
             fs,
             emerg,
+            "", // ident
+            "", // aog
         );
 
         if let Some(tx) = &self.tx {
