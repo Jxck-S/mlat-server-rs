@@ -161,8 +161,10 @@ pub struct ClockPairing {
     /// Number of samples in the buffer
     pub n: usize,
     
-    // Receiver IDs (base is always < peer for consistent ordering)
+    // Receiver IDs (base is always < peer for consistent ordering); used for cleanup/sync_peers
+    #[allow(dead_code)]
     base_id: usize,
+    #[allow(dead_code)]
     peer_id: usize,
     
     /// Distance category (0-3, based on 50km bins)
@@ -645,15 +647,8 @@ fn ecef_distance(p0: &[f64; 3], p1: &[f64; 3]) -> f64 {
     (dx * dx + dy * dy + dz * dz).sqrt()
 }
 
-/// Maximum distance between two positions in the same sync message pair (10km)
-const MAX_INTERMESSAGE_RANGE: f64 = 10e3;
-
-/// Speed of light in air (m/s) for propagation delay
-#[allow(dead_code)]
-const C_AIR: f64 = 299792458.0 / 1.00032;
-
-/// Feet to meters conversion
-const FTOM: f64 = 0.3048;
+/// Use shared constants for sync (match Python config/constants)
+use crate::constants::{FTOM, MAX_INTERMESSAGE_RANGE, MIN_NUC};
 
 /// Receiver info needed for sync operations (avoids needing full Receiver struct)
 #[derive(Debug, Clone)]
@@ -742,13 +737,25 @@ impl ClockTracker {
         self.clock_pairs.get_mut(&key)
     }
     
-    /// Clean up expired pairings
-    pub fn cleanup(&mut self, now: f64) {
-        self.clock_pairs.retain(|_, pairing| {
+    /// Clean up expired pairings. Returns (base_id, peer_id, cat) for each removed pairing
+    /// so the coordinator can decrement sync_peers (Python _cleanup L256-259).
+    pub fn cleanup(&mut self, now: f64) -> Vec<(usize, usize, usize)> {
+        let mut to_remove: Vec<((usize, usize), usize)> = Vec::new();
+        for (key, pairing) in self.clock_pairs.iter_mut() {
             pairing.check_valid(now);
-            (now - pairing.updated <= 45.0)
-                && (pairing.valid || now - pairing.updated <= 30.0)
-        });
+            if now - pairing.updated > 45.0 {
+                to_remove.push((*key, pairing.cat));
+            } else if !pairing.valid && now - pairing.updated > 30.0 {
+                to_remove.push((*key, pairing.cat));
+            }
+        }
+        for (key, _cat) in &to_remove {
+            self.clock_pairs.remove(key);
+        }
+        to_remove
+            .into_iter()
+            .map(|((b, p), c)| (b, p, c))
+            .collect()
     }
     
     /// Clear all sync points (called periodically by coordinator, every ~15s)
@@ -880,9 +887,9 @@ impl ClockTracker {
                     let mut found_match = false;
 
                     for sp in syncpoints.iter_mut() {
-                        // Match by interval (same as Python: 0.75 ms) and by recency so we pair
-                        // receivers that saw the same sync event.
-                        if (sp.interval - interval).abs() < 0.75e-3 && (sp.last_updated - now).abs() < 2.0 {
+                        // Match by interval only (same as Python: 0.75 ms). No recency check —
+                        // second receiver can send the same message pair anytime before clear.
+                        if (sp.interval - interval).abs() < 0.75e-3 {
                             Self::add_to_existing_syncpoint(
                                 &mut self.clock_pairs,
                                 sp,
@@ -1006,10 +1013,10 @@ impl ClockTracker {
             return;
         }
 
-        // NUC quality check (need NUC >= 6)
+        // NUC quality check (config.MIN_NUC)
         let even_nuc = even_df17.nuc.unwrap_or(0);
         let odd_nuc = odd_df17.nuc.unwrap_or(0);
-        if even_nuc < 6 || odd_nuc < 6 {
+        if even_nuc < MIN_NUC || odd_nuc < MIN_NUC {
             self.sync_points.insert(key, SyncPointState::Invalid);
             return;
         }
@@ -1141,34 +1148,50 @@ impl ClockTracker {
                 }
             };
             let cat = (distance / 50e3).min(3.0) as usize;
+            let p0 = r0.sync_peers[cat];
+            let p1 = r1.sync_peers[cat];
 
-            // Get or create pairing
-            let pairing = clock_pairs.entry(pair_key).or_insert_with(|| {
-                let _limit = (0.7 * get_limit(cat) as f64) as usize;
-                let _p0 = r0.sync_peers[cat];
-                let _p1 = r1.sync_peers[cat];
-
-                // Check peer limits before creating
-                // (we can't easily increment sync_peers here because of borrow checker,
-                //  so we do it after the loop — slight deviation from Python)
-                let (base_clock, peer_clock) = if r0.uid < r1_id {
-                    (&r0.clock, &r1.clock)
-                } else {
-                    (&r1.clock, &r0.clock)
-                };
-                ClockPairing::new(base_id, peer_id, base_clock, peer_clock, cat)
-            });
-
-            // Rate limit existing pairings
-            if pairing.n > 8 && now - pairing.update_attempted < 0.2 {
-                continue;
-            }
-
-            // Call update with properly ordered timestamps
-            if r0.uid < r1_id {
-                pairing.update(syncpoint.address, td0_b, td1_b, i0, i1, now, false);
-            } else {
-                pairing.update(syncpoint.address, td1_b, td0_b, i1, i0, now, false);
+            match clock_pairs.get_mut(&pair_key) {
+                Some(pairing) => {
+                    // Existing pairing: rate limit, then 1.2*get_limit check (Python L196-205)
+                    if pairing.n > 8 && now - pairing.update_attempted < 0.2 {
+                        continue;
+                    }
+                    let limit = 1.2 * get_limit(cat) as f64;
+                    if p0 as f64 > limit && p1 as f64 > limit {
+                        if let Some(r) = receivers.get_mut(&r0.uid) {
+                            r.sync_peers[cat] = r.sync_peers[cat].saturating_sub(1);
+                        }
+                        if let Some(r) = receivers.get_mut(&r1_id) {
+                            r.sync_peers[cat] = r.sync_peers[cat].saturating_sub(1);
+                        }
+                        continue;
+                    }
+                    if r0.uid < r1_id {
+                        pairing.update(syncpoint.address, td0_b, td1_b, i0, i1, now, false);
+                    } else {
+                        pairing.update(syncpoint.address, td1_b, td0_b, i1, i0, now, false);
+                    }
+                }
+                None => {
+                    // New pairing: 0.7*get_limit check then create and increment (Python L178-189)
+                    let limit = 0.7 * get_limit(cat) as f64;
+                    if p0 as f64 > limit && p1 as f64 > limit {
+                        continue;
+                    }
+                    let (base_clock, peer_clock) = if r0.uid < r1_id {
+                        (&r0.clock, &r1.clock)
+                    } else {
+                        (&r1.clock, &r0.clock)
+                    };
+                    clock_pairs.insert(pair_key, ClockPairing::new(base_id, peer_id, base_clock, peer_clock, cat));
+                    if let Some(r) = receivers.get_mut(&r0.uid) {
+                        r.sync_peers[cat] = r.sync_peers[cat].saturating_add(1);
+                    }
+                    if let Some(r) = receivers.get_mut(&r1_id) {
+                        r.sync_peers[cat] = r.sync_peers[cat].saturating_add(1);
+                    }
+                }
             }
         }
 

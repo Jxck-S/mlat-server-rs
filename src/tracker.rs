@@ -679,7 +679,7 @@ impl Tracker {
                 }
             }
 
-            // Round 2
+            // Round 2 (Python: ntotal.get(r1, 0.0) < 3.5; no sync_dont_use check in round 2)
             for &(_rp, r1_id, icao, rate) in &ratepair_list {
                 if new_sync.contains(&icao) { continue; }
                 let ac = self.aircraft.get(&icao).unwrap();
@@ -687,13 +687,46 @@ impl Tracker {
 
                 if total_rate > max_sync_rate { break; }
 
-                if *ntotal.get(&r1_id).unwrap_or(&0.0) < 1.0 {
+                if *ntotal.get(&r1_id).unwrap_or(&0.0) < 3.5 {
                     new_sync.insert(icao);
                     total_rate += rate;
                     if let Some(pairs) = ac_to_ratepairs.get(&icao) {
                         for &(rp2, r2_id, _, _) in pairs {
                             *ntotal.entry(r2_id).or_insert(0.0) += rp2;
                         }
+                    }
+                }
+            }
+
+            // addSome: top up to at least MAX_SYNC_AC/4 (Python tracker.py L318-326)
+            let target_min = max_sync_ac / 4;
+            let mut add_some = target_min.saturating_sub(new_sync.len());
+            if add_some > 0 {
+                let mut available: Vec<u32> = ac_to_ratepairs.keys()
+                    .filter(|&&icao| !new_sync.contains(&icao))
+                    .copied()
+                    .collect();
+                if !available.is_empty() {
+                    use rand::seq::SliceRandom;
+                    let n = add_some.min(available.len());
+                    available.shuffle(&mut rand::thread_rng());
+                    for &icao in available.iter().take(n) {
+                        new_sync.insert(icao);
+                    }
+                }
+            }
+            add_some = target_min.saturating_sub(new_sync.len());
+            if add_some > 0 {
+                let mut available: Vec<u32> = receiver.tracking.iter()
+                    .filter(|&&icao| !new_sync.contains(&icao))
+                    .copied()
+                    .collect();
+                if !available.is_empty() {
+                    use rand::seq::SliceRandom;
+                    let n = add_some.min(available.len());
+                    available.shuffle(&mut rand::thread_rng());
+                    for &icao in available.iter().take(n) {
+                        new_sync.insert(icao);
                     }
                 }
             }

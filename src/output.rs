@@ -1,65 +1,33 @@
 use std::time::UNIX_EPOCH;
 use tokio::sync::broadcast;
+use crate::constants::{MTOF, MS_TO_KTS, MS_TO_FPM};
 use crate::mlattrack::MlatResult;
+
+/// Optional aircraft-derived context for output (callsign, squawk, altitude, vrate).
+/// Matches Python BasestationClient's use of coordinator.tracker.aircraft[address].
+#[derive(Clone, Default)]
+pub struct OutputContext {
+    pub callsign: Option<String>,
+    pub squawk: Option<u16>,
+    pub altitude_ft: Option<f64>,
+    pub last_altitude_time: Option<f64>,
+    pub vrate_fpm: Option<i32>,
+    pub vrate_time: Option<f64>,
+}
+
+/// CSV-quote a string for SBS/CSV (Python output.csv_quote)
+fn csv_quote(s: &str) -> String {
+    if s.find('\n').is_none() && !s.contains('"') && !s.contains(',') {
+        s.to_string()
+    } else {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    }
+}
 
 /// Trait for output handlers
 pub trait OutputHandler: Send + Sync {
-    /// Handle a new MLAT result
-    fn handle_result(&mut self, result: &MlatResult);
-}
-
-/// Beast binary format output
-pub struct BeastOutput {
-    tx: Option<broadcast::Sender<Vec<u8>>>,
-}
-
-impl BeastOutput {
-    pub fn new(tx: Option<broadcast::Sender<Vec<u8>>>) -> Self {
-        BeastOutput { tx }
-    }
-
-    /// Encode MLAT result as a Series 2 DF18 extended squitter message in AVR/Beast format
-    fn encode(&self, result: &MlatResult) -> Vec<u8> {
-        // 1. Create synthetic DF18 extended squitter (TIS-B)
-        let mut msg = [0u8; 14];
-        
-        // DF=18, CF=0 (ADS-B), AA=ICAO
-        let icao = result.icao;
-        msg[0] = 0x90 | ((icao >> 16) as u8 & 0x07); // DF=18 (10010), CA=0 (000) -> 10010000 = 0x90
-        msg[1] = (icao >> 16) as u8;
-        msg[2] = (icao >> 8) as u8;
-        msg[3] = icao as u8;
-        
-        // Construct a Beast frame around the raw timestamp
-        let mut frame = Vec::with_capacity(20);
-        frame.push(0x1a); // Escape
-        frame.push(0x32); // Mode 2 (Mode S Short) or 3 (Long)
-        
-        // 12MHz timestamp (6 bytes)
-        let ticks = (result.timestamp * 12e6) as u64;
-        frame.push((ticks >> 40) as u8);
-        frame.push((ticks >> 32) as u8);
-        frame.push((ticks >> 24) as u8);
-        frame.push((ticks >> 16) as u8);
-        frame.push((ticks >> 8) as u8);
-        frame.push(ticks as u8);
-        
-        frame.push(0xFF); // Signal level (max)
-        
-        // Payload (Mode S Message)
-        frame.extend_from_slice(&msg);
-        
-        frame
-    }
-}
-
-impl OutputHandler for BeastOutput {
-    fn handle_result(&mut self, result: &MlatResult) {
-        let bytes = self.encode(result);
-        if let Some(tx) = &self.tx {
-            let _ = tx.send(bytes);
-        }
-    }
+    /// Handle a new MLAT result (context from aircraft when available)
+    fn handle_result(&mut self, result: &MlatResult, context: Option<&OutputContext>);
 }
 
 /// SBS (Basestation) format output
@@ -89,24 +57,82 @@ impl SbsOutput {
 }
 
 impl OutputHandler for SbsOutput {
-    fn handle_result(&mut self, result: &MlatResult) {
-        // MSG,3,1,1,Hex,1,Date,Time,Date,Time,,Alt,,,Lat,Lon,,,0,0,0,0
-        
-        let (date, time) = Self::format_date_time(result.timestamp);
-        
-        let (lat, lon, alt) = crate::geodesy::ecef2llh(
+    fn handle_result(&mut self, result: &MlatResult, context: Option<&OutputContext>) {
+        // Python BasestationClient TEMPLATE: MSG,mtype,1,1,addr,1,rcv_date,rcv_time,now_date,now_time,callsign,altitude,speed,heading,lat,lon,vrate,squawk,fs,emerg,ident,aog
+        let (rcv_date, rcv_time) = Self::format_date_time(result.timestamp);
+        let now = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(result.timestamp);
+        let (now_date, now_time) = Self::format_date_time(now);
+
+        let (lat, lon, _alt_ecef) = crate::geodesy::ecef2llh(
             result.position[0],
             result.position[1],
-            result.position[2]
+            result.position[2],
         );
-        
+        // Python: round(lat, 6), round(lon, 6)
+        let lat = (lat * 1e6).round() / 1e6;
+        let lon = (lon * 1e6).round() / 1e6;
+
+        let callsign = context
+            .and_then(|c| c.callsign.as_deref())
+            .unwrap_or("");
+        let callsign = csv_quote(callsign);
+
+        // Python: never use MLAT altitude; use ac.altitude only when last_altitude_time within 5s
+        let altitude = match context {
+            Some(c) if c.last_altitude_time.map_or(false, |t| result.timestamp - t < 5.0) => {
+                c.altitude_ft.map(|a| (a as i32).to_string()).unwrap_or_default()
+            }
+            _ => String::new(),
+        };
+
+        let speed_str = result
+            .ground_speed
+            .map(|v| (v * MS_TO_KTS).round() as i32)
+            .map(|v| v.to_string())
+            .unwrap_or_default();
+
+        // vrate: Python sets ac.vrate when vrate_time within 5s, else vrate = '' (Kalman vrate is overwritten)
+        let vrate_str = context
+            .and_then(|c| {
+                c.vrate_time
+                    .filter(|&t| result.timestamp - t < 5.0)
+                    .and_then(|_| c.vrate_fpm.map(|v| v.to_string()))
+            })
+            .unwrap_or_default();
+
+        let squawk = context
+            .and_then(|c| c.squawk)
+            .map(|s| csv_quote(&format!("{:04o}", s)))
+            .unwrap_or_else(|| csv_quote(""));
+
+        let fs = result.receivers.len();
+        let emerg = if result.error >= 0.0 {
+            (result.error as i64).to_string()
+        } else {
+            String::new()
+        };
+
+        // ident and aog empty per Python TEMPLATE
         let sbs = format!(
-            "MSG,3,1,1,{:06X},1,{},{},{},{},,{},,,{:.5},{:.5},,,0,0,0,0\r\n",
+            "MSG,3,1,1,{:06X},1,{},{},{},{},{},{},{},,{:.6},{:.6},{},{},{},{},,\n",
             result.icao,
-            date, time, date, time,
-            (alt * 3.28084) as i32, // Altitude in feet
+            rcv_date,
+            rcv_time,
+            now_date,
+            now_time,
+            callsign,
+            altitude,
+            speed_str,
+            "", // heading (Python uses Kalman when use_kalman_data; we don't have heading in MlatResult)
             lat,
-            lon
+            lon,
+            vrate_str,
+            squawk,
+            fs,
+            emerg,
         );
 
         if let Some(tx) = &self.tx {
@@ -134,7 +160,7 @@ impl CsvOutput {
 }
 
 impl OutputHandler for CsvOutput {
-    fn handle_result(&mut self, result: &MlatResult) {
+    fn handle_result(&mut self, result: &MlatResult, _context: Option<&OutputContext>) {
         if let Some(writer) = &self.writer {
             if let Ok(mut w) = writer.lock() {
                 use std::io::Write;
@@ -143,16 +169,19 @@ impl OutputHandler for CsvOutput {
                     result.position[1],
                     result.position[2]
                 );
-                
-                // Format: timestamp,icao,lat,lon,alt_ft
+                let speed_kts = result.ground_speed.map(|v| (v * MS_TO_KTS).round() as i32);
+                let vrate_fpm = result.vertical_speed.map(|v| (v * MS_TO_FPM).round() as i32);
+                // Format: timestamp,icao,lat,lon,alt_ft,speed_kts,vrate_fpm (Python: speed/vrate from Kalman)
                 if let Err(e) = writeln!(
                     w,
-                    "{:.6},{:06X},{:.5},{:.5},{:.0}",
+                    "{:.6},{:06X},{:.5},{:.5},{:.0},{},{}",
                     result.timestamp,
                     result.icao,
                     lat,
                     lon,
-                    alt * 3.28084
+                    alt * MTOF,
+                    speed_kts.map(|v| v.to_string()).unwrap_or_default(),
+                    vrate_fpm.map(|v| v.to_string()).unwrap_or_default()
                 ) {
                     eprintln!("Failed to write CSV: {}", e);
                 }
@@ -181,13 +210,13 @@ impl JsonOutput {
         
         format!(
             "{{\"icao\": \"{:06X}\", \"lat\": {:.5}, \"lon\": {:.5}, \"alt\": {:.0}, \"ts\": {:.6}}}",
-            result.icao, lat, lon, alt * 3.28084, result.timestamp
+            result.icao, lat, lon, alt * MTOF, result.timestamp
         )
     }
 }
 
 impl OutputHandler for JsonOutput {
-    fn handle_result(&mut self, result: &MlatResult) {
+    fn handle_result(&mut self, result: &MlatResult, _context: Option<&OutputContext>) {
         let json = Self::format_json(result);
         // Currently implies logging or future usage
         let _ = json;
@@ -197,25 +226,6 @@ impl OutputHandler for JsonOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_beast_output_encode() {
-        let output = BeastOutput::new(None);
-        let result = MlatResult {
-            icao: 0x4840D6,
-            position: [0.0, 0.0, 0.0], // ECEF
-            timestamp: 100.0,
-            covariance: None,
-            distinct: 4,
-            dof: 3,
-            error: 10.0,
-            receivers: vec![1, 2, 3, 4],
-        };
-        
-        let bytes = output.encode(&result);
-        assert_eq!(bytes[0], 0x1a); 
-        // ... (rest of checks)
-    }
 
     #[test]
     fn test_sbs_format_date_time() {
@@ -237,6 +247,8 @@ mod tests {
             dof: 3,
             error: 10.0,
             receivers: vec![1, 2, 3, 4],
+            ground_speed: None,
+            vertical_speed: None,
         };
         
         let json = JsonOutput::format_json(&result);

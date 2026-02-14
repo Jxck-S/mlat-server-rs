@@ -5,12 +5,7 @@ use nalgebra as na;
 use na::{DVector, DMatrix};
 
 use crate::geodesy;
-
-// Constants from mlat/constants.py and mlat/config.py
-const C_AIR: f64 = 299792458.0 / 1.00032; // Speed of light in air
-const MIN_ALT: f64 = -1500.0 * 0.3048;    // -1500 feet in meters
-const MAX_ALT: f64 = 75000.0 * 0.3048;    // 75000 feet in meters
-const SOLVER_MAXFEV: usize = 165;          // Max function evaluations
+use crate::constants::{CAIR as C_AIR, MAX_ALT_M as MAX_ALT, MIN_ALT_M as MIN_ALT, SOLVER_MAXFEV};
 
 /// Measurement from a receiver
 #[derive(Debug, Clone)]

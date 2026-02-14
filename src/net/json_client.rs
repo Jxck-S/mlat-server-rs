@@ -5,9 +5,16 @@ use std::time::{Duration, Instant};
 use tokio::time;
 use std::io;
 use std::sync::Arc;
+use rand::Rng;
 
 use super::connection::Connection;
 use super::messages::{ClientMessage, HandshakeRequest, ServerMessage, SyncPayload};
+
+/// Python util.fuzzy(t): random value in [0.9*t, 1.1*t] rounded to integer. Used for reconnect_in.
+fn fuzzy(t: f64) -> u32 {
+    let r = rand::thread_rng().gen_range(0.9 * t..=1.1 * t);
+    r.round() as u32
+}
 
 /// State of a JSON client connection
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -229,10 +236,10 @@ impl JsonClient {
 
         eprintln!("Handshake successful ({})", connection_info);
 
-        // Send handshake response
+        // Send handshake response (Python: reconnect_in=util.fuzzy(10) => 9-11)
         let response = ServerMessage::Handshake {
             motd: self.motd.clone(),
-            reconnect_in: None,
+            reconnect_in: Some(fuzzy(10.0)),
             compress: Some("none".to_string()),
             selective_traffic: Some(true),
             heartbeat: Some(true),
@@ -248,11 +255,11 @@ impl JsonClient {
         Ok(true)
     }
     
-    /// Send a handshake error message
+    /// Send a handshake error message (Python: reconnect_in=util.fuzzy(900) => 810-990)
     async fn send_handshake_error(&mut self, error: &str) -> io::Result<()> {
         let msg = serde_json::json!({
             "deny": [error],
-            "reconnect_in": 900
+            "reconnect_in": fuzzy(900.0)
         });
         self.connection.write_json(&msg).await
     }
@@ -278,6 +285,11 @@ impl JsonClient {
             Some(o) => o,
             None => return Ok(()),
         };
+
+        // Python: message_counter += 1 per JSON message (for message_rate in write_state)
+        if let Some(rid) = self.receiver_id {
+            self.coordinator.increment_receiver_message_count(rid).await;
+        }
 
         if let Some(sync_val) = obj.get("sync") {
             if let Ok(payload) = serde_json::from_value::<SyncPayload>(sync_val.clone()) {
@@ -367,6 +379,10 @@ impl JsonClient {
     }
 
     async fn dispatch_client_message(&mut self, msg: ClientMessage) -> io::Result<()> {
+        // Python: message_counter += 1 per message (tag format path)
+        if let Some(rid) = self.receiver_id {
+            self.coordinator.increment_receiver_message_count(rid).await;
+        }
         match msg {
             ClientMessage::Heartbeat {} => {},
             ClientMessage::Handshake { .. } => {

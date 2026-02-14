@@ -1,5 +1,20 @@
 use clap::Parser;
 
+/// AGPL v3: URL where this server's source code is available (Python: config.AGPL_SERVER_CODE_URL).
+/// Must point to the code this server is running. See COPYING and README.
+pub const AGPL_SERVER_CODE_URL: &str = "https://github.com/wiedehopf/mlat-server";
+
+/// Build MOTD string sent to clients: user motd + AGPL notice and source URL (Python: expanded_motd).
+pub fn expanded_motd(motd: &str) -> String {
+    format!(
+        "\n\n{}\n\nThe multilateration server source code is available under\
+         \nthe terms of the Affero GPL (v3 or later). You may obtain\
+         \na copy of this server's source code at the following\
+         \nlocation: {}",
+        motd, AGPL_SERVER_CODE_URL
+    )
+}
+
 /// MLAT Server Configuration
 #[derive(Parser, Debug, Clone)]
 #[command(author, version, about, long_about = None)]

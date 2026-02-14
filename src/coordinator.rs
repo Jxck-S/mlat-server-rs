@@ -1,13 +1,16 @@
 // Coordinator - top level glue between receivers, tracker, clock sync, and MLAT processing
 // Ported from mlat/coordinator.py
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::time::Duration;
 use tracing::{debug, info};
 use std::sync::Arc;
 use std::path::Path;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, mpsc};
 use tokio::io::AsyncWriteExt;
 
+use crate::constants::{MTOF, MLAT_DELAY};
+use crate::mlattrack::MlatAction;
 
 /// Username prefix for debug/focus logging (Python config.DEBUG_FOCUS). Receivers with user starting with this get focus=true.
 const DEBUG_FOCUS: &str = "euerdorf";
@@ -33,6 +36,14 @@ pub struct Coordinator {
     /// Status log interval in seconds. <= 0 = disabled.
     status_interval_secs: i32,
 
+    /// Cohort delay: batches of ICAOs to resolve after MLAT_DELAY (Python: Cohort with call_later(MLAT_DELAY, _process)).
+    /// Current cohort: (icaos, creation_instant). New cohort when creation > 50ms ago or len >= 25.
+    cohort: Arc<RwLock<Option<Arc<RwLock<(HashSet<u32>, tokio::time::Instant)>>>>>,
+    /// Channel to signal "this cohort's icaos are ready to resolve" (sent by delayed task after MLAT_DELAY).
+    cohort_ready_tx: mpsc::Sender<HashSet<u32>>,
+    /// Receiver for cohort_ready_tx; taken by run() to process delayed cohorts.
+    cohort_ready_rx: std::sync::Mutex<Option<mpsc::Receiver<HashSet<u32>>>>,
+
     // Stats
     pub total_mlat_messages: Arc<RwLock<usize>>,
     pub total_sync_messages: Arc<RwLock<usize>>,
@@ -48,6 +59,7 @@ impl Coordinator {
     /// Create a new coordinator with work_dir and status_interval (for production).
     /// When status_interval > 0, logs "Status: (N clients ...)" every status_interval seconds.
     pub fn new_with_status(work_dir: String, status_interval: i32) -> Self {
+        let (cohort_ready_tx, cohort_ready_rx) = mpsc::channel(64);
         Coordinator {
             receivers: Arc::new(RwLock::new(HashMap::new())),
             usernames: Arc::new(RwLock::new(HashMap::new())),
@@ -59,6 +71,9 @@ impl Coordinator {
             client_channels: Arc::new(RwLock::new(HashMap::new())),
             work_dir,
             status_interval_secs: status_interval,
+            cohort: Arc::new(RwLock::new(None)),
+            cohort_ready_tx,
+            cohort_ready_rx: std::sync::Mutex::new(Some(cohort_ready_rx)),
             total_mlat_messages: Arc::new(RwLock::new(0)),
             total_sync_messages: Arc::new(RwLock::new(0)),
             total_solutions: Arc::new(RwLock::new(0)),
@@ -237,12 +252,12 @@ impl Coordinator {
         // Ensure MLAT wanted status is up to date
         tracker.update_mlat_wanted(now_unix);
 
-        // 5. MLAT Processing
+        // 5. MLAT Processing (Python: receiver_mlat adds to cohort; resolution after MLAT_DELAY)
         let receivers = self.receivers.read().await;
         let mut mlat_tracker = self.mlat_tracker.write().await;
         let clock_tracker = self.clock_tracker.read().await;
-        
-        if let Some(result) = mlat_tracker.process_message(
+
+        if let Some(MlatAction::Delayed(icao)) = mlat_tracker.process_message(
             receiver_id,
             bytes,
             timestamp,
@@ -252,21 +267,91 @@ impl Coordinator {
             &mut tracker,
             &clock_tracker,
         ) {
-            // 6. Forward results to participating receivers for clock tuning
-            self.forward_results(&result).await;
-            
-            *self.total_solutions.write().await += 1;
-
-            // 7. Distribute Result
-            let mut outputs = self.outputs.write().await;
-            for output in outputs.iter_mut() {
-                output.handle_result(&result);
-            }
+            self.add_icao_to_cohort(icao).await;
         }
         
         // Log for debug (can remove later or move to trace level)
         if df == 17 {
             // println!("Parsed DF{} from {:06X}: {}", df, icao, message_hex);
+        }
+    }
+
+    /// Add ICAO to current cohort; start new cohort if >50ms or >=25 groups (Python: now - cohort.creationTime > 0.05 or cohort.len > 25).
+    /// Schedules processing after MLAT_DELAY (0.9s) when a new cohort is created.
+    async fn add_icao_to_cohort(&self, icao: u32) {
+        const COHORT_MAX_AGE_SECS: f64 = 0.05;
+        const COHORT_MAX_GROUPS: usize = 25;
+
+        let mut cohort_guard = self.cohort.write().await;
+        let need_new = match cohort_guard.as_ref() {
+            None => true,
+            Some(arc) => {
+                let guard = arc.read().await;
+                guard.1.elapsed() > Duration::from_secs_f64(COHORT_MAX_AGE_SECS) || guard.0.len() >= COHORT_MAX_GROUPS
+            }
+        };
+
+        if need_new {
+            let arc = Arc::new(RwLock::new((
+                HashSet::from([icao]),
+                tokio::time::Instant::now(),
+            )));
+            *cohort_guard = Some(Arc::clone(&arc));
+            drop(cohort_guard);
+
+            let tx = self.cohort_ready_tx.clone();
+            tokio::spawn(async move {
+                let creation = arc.read().await.1;
+                tokio::time::sleep_until(creation + Duration::from_secs_f64(MLAT_DELAY)).await;
+                let icaos: HashSet<u32> = arc.write().await.0.drain().collect();
+                let _ = tx.send(icaos).await;
+            });
+        } else {
+            let arc = cohort_guard.as_ref().unwrap().clone();
+            drop(cohort_guard);
+            arc.write().await.0.insert(icao);
+        }
+    }
+
+    /// Process a cohort that has been delayed by MLAT_DELAY (Python: cohort._process -> group.handle(group) -> _resolve).
+    async fn process_delayed_cohort(&self, icaos: HashSet<u32>) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+
+        let receivers = self.receivers.read().await;
+        let clock_tracker = self.clock_tracker.read().await;
+
+        for icao in icaos {
+            let result = {
+                let mut mlat_tracker = self.mlat_tracker.write().await;
+                let mut tracker = self.tracker.write().await;
+                let ac = match tracker.get_mut(icao) {
+                    Some(a) => a,
+                    None => continue,
+                };
+                mlat_tracker.try_resolve_pending(icao, &receivers, ac, &clock_tracker, now)
+            };
+            if let Some(ref result) = result {
+                self.forward_results(result).await;
+                *self.total_solutions.write().await += 1;
+                let context = {
+                    let tracker = self.tracker.read().await;
+                    tracker.get(result.icao).map(|ac| crate::output::OutputContext {
+                        callsign: ac.callsign.clone(),
+                        squawk: ac.squawk,
+                        altitude_ft: ac.altitude,
+                        last_altitude_time: ac.last_altitude_time,
+                        vrate_fpm: ac.vrate,
+                        vrate_time: ac.vrate_time,
+                    })
+                };
+                let mut outputs = self.outputs.write().await;
+                for output in outputs.iter_mut() {
+                    output.handle_result(result, context.as_ref());
+                }
+            }
         }
     }
     
@@ -382,6 +467,14 @@ impl Coordinator {
         self.receivers.read().await.get(&receiver_id).cloned()
     }
 
+    /// Increment message counter for a receiver (Python: connection.message_counter += 1 per JSON message).
+    /// Used for message_rate = counter/15 in write_state.
+    pub async fn increment_receiver_message_count(&self, receiver_id: usize) {
+        if let Some(r) = self.receivers.write().await.get_mut(&receiver_id) {
+            r.message_counter = r.message_counter.saturating_add(1);
+        }
+    }
+
     /// Notes that the given receiver has disconnected. Removes from receivers, usernames, tracker, and clock_tracker.
     /// Mirrors Python coordinator.receiver_disconnect (coordinator.py L643-654).
     pub async fn receiver_disconnect(&self, receiver_id: usize) {
@@ -450,7 +543,7 @@ impl Coordinator {
             addr: format!("{:06x}", result.icao),
             lat,
             lon,
-            alt: alt * 3.2808399, // MTOF conversion
+            alt: alt * MTOF, // constants::MTOF (1/0.3038)
             callsign: None,
             squawk: None,
             hdop: None,
@@ -539,7 +632,7 @@ impl Coordinator {
             let receivers = self.receivers.read().await;
             let mut tracker = self.tracker.write().await;
             // Use constants from config equivalent
-            tracker.update_interest(receiver_id, &receivers, now, 10, 40.0)
+            tracker.update_interest(receiver_id, &receivers, now, 15, 12.0)
         };
 
         // 2. Update interest sets and get traffic request changes
@@ -643,7 +736,7 @@ impl Coordinator {
 
             let mut sync = serde_json::Map::new();
             let mut clients = serde_json::Map::new();
-            for (_uid, r) in receivers.iter() {
+            for (_uid, r) in receivers.iter_mut() {
                 let user = r.user.clone();
                 let peers = receiver_states.get(&user).cloned().unwrap_or_default();
                 let peers_map: serde_json::Map<String, serde_json::Value> = peers.into_iter().map(|(k, v)| (k, serde_json::Value::Array(v))).collect();
@@ -655,6 +748,9 @@ impl Coordinator {
                 }));
                 let sync_interest: Vec<String> = r.sync_interest.iter().map(|&icao| format!("{:06x}", icao)).collect();
                 let mlat_interest: Vec<String> = r.mlat_interest.iter().map(|&icao| format!("{:06x}", icao)).collect();
+                // Python: message_rate = round(r.connection.message_counter / 15.0); then reset counter
+                let message_rate = (r.message_counter as f64 / 15.0).round() as i64;
+                r.message_counter = 0;
                 clients.insert(user.clone(), serde_json::json!({
                     "user": r.user,
                     "uid": r.uid,
@@ -667,7 +763,7 @@ impl Coordinator {
                     "connection": r.connection_info,
                     "source_ip": r.source_ip.as_deref().unwrap_or(""),
                     "source_port": r.source_port.unwrap_or(0),
-                    "message_rate": 0,
+                    "message_rate": message_rate,
                     "peer_count": peers_map.len(),
                     "bad_sync_timeout": (r.bad_syncs * 15.0 / 0.1).round(),
                     "outlier_percent": (r.outlier_percent_rolling * 10.0).round() / 10.0,
@@ -731,6 +827,8 @@ impl Coordinator {
                 aircraft.insert(icao_hex, serde_json::Value::Object(s));
             }
             let aircraft_json = serde_json::Value::Object(aircraft);
+            // Clear sync point cache periodically (Python: every 15s after _write_state)
+            clock_tracker.clear_all_sync_points();
             (sync_json, clients_json, aircraft_json, n)
         };
 
@@ -775,9 +873,14 @@ impl Coordinator {
         eprintln!("{}", title_string);
     }
 
-    /// Run periodic tasks for the coordinator (refresh interest, status log, write_state when enabled)
+    /// Run periodic tasks for the coordinator (refresh interest, status log, write_state when enabled).
+    /// Also receives delayed cohort batches and processes them (MLAT_DELAY 0.9s).
     pub async fn run(&self) {
         use std::time::Duration;
+        let mut cohort_rx = match self.cohort_ready_rx.lock().unwrap().take() {
+            Some(r) => r,
+            None => return, // run() already called or not using cohort channel
+        };
         let mut ticker = tokio::time::interval(Duration::from_millis(500));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let status_secs = self.status_interval_secs;
@@ -796,20 +899,55 @@ impl Coordinator {
         } else {
             None
         };
+        // Clock pairing cleanup every 10s (Python _cleanup); decrement sync_peers for removed pairings
+        let cleanup_interval_secs = 10u64;
+        let mut next_cleanup = tokio::time::Instant::now() + Duration::from_secs(cleanup_interval_secs);
         loop {
-            ticker.tick().await;
-            self.refresh_interest().await;
-            if let Some(ref mut next) = next_status {
-                if tokio::time::Instant::now() >= *next {
-                    *next += Duration::from_secs(status_secs as u64);
-                    self.log_status().await;
-                }
-            }
-            if let Some(ref mut next) = next_write_state {
-                if tokio::time::Instant::now() >= *next {
-                    *next += Duration::from_secs(write_interval_secs);
-                    self.write_state().await;
-                }
+            tokio::select! {
+                msg = cohort_rx.recv() => match msg {
+                    Some(icaos) => self.process_delayed_cohort(icaos).await,
+                    None => break, // channel closed
+                },
+                tick = ticker.tick() => {
+                    let _ = tick; // ignore Instant
+                    self.refresh_interest().await;
+                    if let Some(ref mut next) = next_status {
+                        if tokio::time::Instant::now() >= *next {
+                            *next += Duration::from_secs(status_secs as u64);
+                            self.log_status().await;
+                        }
+                    }
+                    if let Some(ref mut next) = next_write_state {
+                        if tokio::time::Instant::now() >= *next {
+                            *next += Duration::from_secs(write_interval_secs);
+                            self.write_state().await;
+                        }
+                    }
+                    if tokio::time::Instant::now() >= next_cleanup {
+                        next_cleanup += Duration::from_secs(cleanup_interval_secs);
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_secs_f64();
+                        let removed = {
+                            let mut clock_tracker = self.clock_tracker.write().await;
+                            clock_tracker.cleanup(now)
+                        };
+                        if !removed.is_empty() {
+                            let mut receivers = self.receivers.write().await;
+                            for (base_id, peer_id, cat) in removed {
+                                if cat < 5 {
+                                    if let Some(r) = receivers.get_mut(&base_id) {
+                                        r.sync_peers[cat] = r.sync_peers[cat].saturating_sub(1);
+                                    }
+                                    if let Some(r) = receivers.get_mut(&peer_id) {
+                                        r.sync_peers[cat] = r.sync_peers[cat].saturating_sub(1);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                },
             }
         }
     }

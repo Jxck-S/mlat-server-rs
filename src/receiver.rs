@@ -62,6 +62,9 @@ pub struct Receiver {
     
     // Rate reporting
     pub last_rate_report: Option<HashMap<u32, f64>>,
+
+    /// Messages received since last write_state (Python: connection.message_counter). Used for message_rate = counter/15.
+    pub message_counter: u32,
 }
 
 impl Receiver {
@@ -130,6 +133,7 @@ impl Receiver {
             map_lon: None,
             map_alt: None,
             last_rate_report: None,
+            message_counter: 0,
         }
     }
 

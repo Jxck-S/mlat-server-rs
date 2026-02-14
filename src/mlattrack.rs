@@ -4,14 +4,15 @@
 use std::collections::{HashMap, HashSet};
 use tracing::debug;
 use crate::modes::message::{self, ModeSMessage, DecodedMessage};
+use crate::constants::{CAIR, FTOM, MAX_GROUP, RESOLVE_INTERVAL, RESOLVE_BACKOFF};
 
-/// Constants for MLAT tracking
-const MAX_GROUP: usize = 50;           // Maximum copies per message group
-const RESOLVE_INTERVAL: f64 = 0.5;     // Minimum time between resolve attempts (seconds)
-#[allow(dead_code)]
-const RESOLVE_BACKOFF: f64 = 2.0;      // Backoff multiplier for resolve attempts
-const FTOM: f64 = 0.3048;              // Feet to meters conversion
-const CAIR: f64 = 343.0;               // Speed of sound in air (m/s)
+/// Result of process_message: coordinator should schedule delayed resolution for this ICAO (Python: cohort MLAT_DELAY).
+#[derive(Debug, Clone, Copy)]
+pub enum MlatAction {
+    /// Add to cohort; resolve after MLAT_DELAY (0.9s).
+    Delayed(u32),
+}
+
 const MAX_TIMESTAMP_DELTA: f64 = 2e-3; // Maximum timestamp difference for clustering (2ms)
 const MIN_DISTINCT_DISTANCE: f64 = 1e3; // Minimum distance for distinct receivers (1km)
 
@@ -81,6 +82,10 @@ pub struct MlatResult {
     pub dof: usize,
     pub error: f64,  // meters
     pub receivers: Vec<usize>,
+    /// Ground speed (m/s) from Kalman when available; used for SBS/CSV speed in kts.
+    pub ground_speed: Option<f64>,
+    /// Vertical speed (m/s) from Kalman when available; used for SBS/CSV vrate in fpm.
+    pub vertical_speed: Option<f64>,
 }
 
 /// Cluster timestamps into groups that are probably copies of the same transmission
@@ -179,7 +184,7 @@ pub fn cluster_timestamps(
                     
                     // Check if timestamp difference is consistent with distance
                     let time_diff = (measurement.timestamp - candidate_timestamp).abs();
-                    let max_time_diff = (distance * 1.05 + 1e3) / CAIR;
+                    let max_time_diff = (distance * 1.05 + 1e3) / CAIR; // Cair = speed of light
                     
                     if time_diff > max_time_diff {
                         can_cluster = false;
@@ -258,9 +263,31 @@ pub fn resolve(
             return None;
         }
     aircraft.last_resolve_attempt = now;
+
+    // Elapsed and backoff (Python: last_result_time with 120s reset, elapsed, RESOLVE_BACKOFF checks)
+    let (last_result_dof, last_result_time) = match (aircraft.last_result_position, aircraft.last_result_time) {
+        (None, _) | (_, None) => (0, message_group.first_seen - 120.0),
+        (_, Some(t)) if message_group.first_seen - t > 120.0 => (0, message_group.first_seen - 120.0),
+        _ => (aircraft.last_result_dof.unwrap_or(0), aircraft.last_result_time.unwrap()),
+    };
+    let mut elapsed = message_group.first_seen - last_result_time;
+    if elapsed < 0.0 {
+        elapsed = 0.0;
+    }
+    if elapsed < RESOLVE_BACKOFF {
+        return None;
+    }
     
     // Get altitude and altitude DOF
     let (altitude, altitude_dof) = get_altitude_from_group(message_group, aircraft);
+    let len_copies = message_group.copies.len();
+    if len_copies + altitude_dof < 4 {
+        return None;
+    }
+    let max_dof = len_copies + altitude_dof - 4;
+    if elapsed < 2.0 * RESOLVE_BACKOFF && (max_dof as f64) < (last_result_dof as f64 - elapsed + 0.5) {
+        return None;
+    }
     
     // Build timestamp map
     let mut timestamp_map: HashMap<usize, Vec<(f64, f64)>> = HashMap::new();
@@ -268,6 +295,14 @@ pub fn resolve(
         timestamp_map.entry(copy.receiver_id)
             .or_insert_with(Vec::new)
             .push((copy.timestamp, copy.utc));
+    }
+    let dof_pre = timestamp_map.len() + altitude_dof;
+    if dof_pre < 4 {
+        return None;
+    }
+    let dof_pre = dof_pre - 4;
+    if elapsed < 2.0 * RESOLVE_BACKOFF && (dof_pre as f64) < (last_result_dof as f64 - elapsed + 0.5) {
+        return None;
     }
     
     // Normalize timestamps using graph-based clock synchronization
@@ -384,7 +419,7 @@ pub fn resolve(
             aircraft.last_result_time = Some(cluster.first_seen);
             aircraft.mlat_result_count += 1;
             
-            // Return result
+            // Return result (include Kalman speed/vrate for SBS/CSV output)
             return Some(MlatResult {
                 icao: aircraft.icao,
                 timestamp: cluster.first_seen,
@@ -400,6 +435,8 @@ pub fn resolve(
                 dof,
                 error,
                 receivers: cluster.measurements.iter().map(|m| m.receiver_id).collect(),
+                ground_speed: aircraft.kalman.ground_speed,
+                vertical_speed: aircraft.kalman.vertical_speed,
             });
         }
     }
@@ -602,9 +639,9 @@ impl MlatTracker {
         }
     }
     
-    /// Process a message from a receiver
-    /// 
-    /// Buffers the message and triggers resolution if ready
+    /// Process a message from a receiver.
+    /// Buffers the message; does not resolve immediately. Returns Delayed(icao) when the group
+    /// should be resolved after MLAT_DELAY (Python: cohort with loop.call_later(MLAT_DELAY, _process)).
     pub fn process_message(
         &mut self,
         receiver_id: usize,
@@ -612,10 +649,10 @@ impl MlatTracker {
         timestamp: f64,
         utc: f64,
         icao: u32,
-        receivers: &HashMap<usize, crate::receiver::Receiver>,
-        tracker: &mut crate::tracker::Tracker,
-        clock_tracker: &crate::clocktrack::ClockTracker,
-    ) -> Option<MlatResult> {
+        _receivers: &HashMap<usize, crate::receiver::Receiver>,
+        _tracker: &mut crate::tracker::Tracker,
+        _clock_tracker: &crate::clocktrack::ClockTracker,
+    ) -> Option<MlatAction> {
         let mut process_now = false;
 
         // Get or create group for this ICAO
@@ -646,24 +683,28 @@ impl MlatTracker {
              self.groups.insert(icao, group);
              process_now = true;
         }
-        
-                if process_now {
-             // println!("Processing group for ICAO {:06X}", icao);
-             if let Some(group) = self.groups.get(&icao) {
-                 if let Some(ac) = tracker.get_mut(icao) {
 
-                         if let Some(result) = resolve(group, receivers, ac, clock_tracker, utc) {
-                             // Success! State updated in resolve()
-                             // In Python, result is just used to update aircraft state
-                             // But we also want to return it for output distribution
-                             return Some(result);
-                         }
-                    }
-                     }
-                 }
-
-        
+        // Python: resolution happens in cohort._process() after MLAT_DELAY. Return Delayed(icao)
+        // so coordinator can add to cohort and schedule processing.
+        if process_now {
+            return Some(MlatAction::Delayed(icao));
+        }
         None
+    }
+
+    /// Resolve a single ICAO's pending group after cohort delay (Python: _resolve called from cohort._process).
+    /// Removes the group from pending (Python: del self.pending[group.message]); returns Some(MlatResult) if resolved.
+    pub fn try_resolve_pending(
+        &mut self,
+        icao: u32,
+        receivers: &HashMap<usize, crate::receiver::Receiver>,
+        aircraft: &mut crate::tracker::TrackedAircraft,
+        clock_tracker: &crate::clocktrack::ClockTracker,
+        now: f64,
+    ) -> Option<MlatResult> {
+        let group = self.groups.remove(&icao)?;
+        let result = resolve(&group, receivers, aircraft, clock_tracker, now)?;
+        Some(result)
     }
 }
 

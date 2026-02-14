@@ -59,6 +59,66 @@ Or run the built binary:
   --verbose
 ```
 
+## Architecture
+
+### Overview
+
+The server has two main directions of flow:
+
+- **Input**: mlat clients (receivers) connect over TCP or UDP and send Mode S messages and sync data. The server maintains one **receiver** per client (one connection per username).
+- **Output**: MLAT results (position solutions) are sent to configured outputs: Basestation-format TCP (connect or listen), CSV files, and optional work-dir JSON/HTTP.
+
+A single **Coordinator** ties everything together: it owns receivers, the aircraft **tracker**, **clock tracker** (receiver clock sync), and **MLAT tracker** (solver). When a solution is produced, the coordinator calls each registered **output handler**.
+
+### Inputs (clients and listeners)
+
+| Component | Parameter | Direction | Description |
+|-----------|-----------|-----------|-------------|
+| **Client TCP listener** | `--client-listen ADDR` | Clients → server | Listen for mlat-client connections. Format: `[host:]tcp_port[:udp_port]` (e.g. `4100` or `0.0.0.0:4100:4101`). Each accepted connection becomes a **JSON client**; after handshake (user, lat, lon, alt) a **receiver** is created and messages (MLAT + sync) are processed by the coordinator. |
+| **Client UDP** | (same `--client-listen` with optional `:udp_port`) | Clients → server | Optional UDP port for the same client protocol. |
+| **MOTD** | `--motd TEXT` | Server → clients | Message of the day sent to clients on connect (AGPL notice is always appended). |
+
+Clients send timestamped Mode S messages and sync messages. The server uses them for clock modeling and multilateration; results are then pushed to outputs.
+
+### Outputs (results and state)
+
+| Component | Parameter | Direction | Description |
+|-----------|-----------|-----------|-------------|
+| **Basestation connect** | `--basestation-connect HOST:PORT` | Server → remote | Server connects out to the given host:port and streams Basestation-format (SBS) lines for each MLAT result. |
+| **Basestation listen** | `--basestation-listen ADDR` | Remote → server, then server → client | Server listens on `[host:]port`; when a client connects, the server streams SBS to that client. |
+| **Filtered Basestation** | `--filtered-basestation-connect`, `--filtered-basestation-listen` | Same as above | Same as above but filtered (e.g. by aircraft or region). |
+| **CSV** | `--write-csv FILE` | Server → file | Append one CSV row per MLAT result to the given file(s). |
+| **Work directory** | `--work-dir DIR` | Server → files | Writes `sync.json`, `clients.json`, `aircraft.json` (and handshakes.log) for debugging/stats. |
+| **HTTP server** | `HTTP_PORT` (env) | Browser/tools → server | If set, serves the work directory over HTTP (read-only). No CLI flag. |
+
+### Flow summary
+
+```
+mlat-client (TCP/UDP)  ──►  Client listeners  ──►  JsonClient  ──►  Coordinator
+                                                                        │
+                                    ┌───────────────────────────────────┼───────────────────────────────────┐
+                                    ▼                   ▼               ▼                                   ▼
+                            Receiver (per client)   Tracker      ClockTracker   MlatTracker (solver)
+                                    │                   │               │               │
+                                    └───────────────────┴───────────────┴───────────────┘
+                                                                        │
+                                                                        ▼
+                                                            MLAT results (position, time)
+                                                                        │
+                                    ┌───────────────────────────────────┼───────────────────────────────────┐
+                                    ▼                   ▼               ▼                                   ▼
+                            Basestation (connect)  Basestation (listen)  CSV files   Work-dir JSON / HTTP
+```
+
+### Other parameters (behavior and tuning)
+
+- `--work-dir` — Directory for state files and blacklist; required for writing sync/clients/aircraft JSON.
+- `--partition N/COUNT` — Partitioning (e.g. `1/1` = no partition).
+- `--tag` — Process name prefix in logs.
+- `--status-interval SECS` — How often to log status (e.g. client count); multiple of 15, or `-1` to disable.
+- `--dump-pseudorange FILE` — Dump pseudorange JSON for debugging.
+- `--verbose` / `-v` — DEBUG logging.
+
 ## Docker
 
 Build and run with Docker Compose (Rust is installed only in the build stage; the running image is minimal Debian):

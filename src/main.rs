@@ -94,7 +94,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 match TcpServer::start_with_coordinator(
                     addr,
                     coordinator.clone(),
-                    config.motd.clone(),
+                    mlat_server::config::expanded_motd(&config.motd),
                 ).await {
                     Ok(server) => {
                         eprintln!("JSON client handler listening on {} (TCP)", server.addr());
@@ -124,7 +124,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 2. Setup Outputs
     
-    // Create broadcast channel for network outputs (SBS/Beast)
+    // Create broadcast channel for network outputs (SBS)
     // Capacity 100 messages
     let (tx, _rx) = tokio::sync::broadcast::channel(100);
     

@@ -6,11 +6,10 @@ use na::{DMatrix, DVector};
 use std::f64::consts::PI;
 
 use crate::geodesy;
+use crate::constants::CAIR as C_AIR;
 use super::unscented::{Moments, moments2points, unscented_filter_predict, unscented_filter_correct};
 
-// Constants from mlat/constants.py
 const DTOR: f64 = PI / 180.0;
-const C_AIR: f64 = 299792458.0 / 1.00029; // Speed of light in air
 
 /// Kalman filter state for a single aircraft
 ///
