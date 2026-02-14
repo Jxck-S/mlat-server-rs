@@ -2,6 +2,7 @@
 // Ported from mlat/coordinator.py (Receiver class)
 
 use std::collections::{HashMap, HashSet};
+use rand::Rng;
 use crate::geodesy;
 use crate::clocktrack::Clock;
 
@@ -130,6 +131,26 @@ impl Receiver {
             map_alt: None,
             last_rate_report: None,
         }
+    }
+
+    /// Set map position (privacy-fudged for sync.json display). Mirrors Python
+    /// coordinator.receiver_location_update: precision=20, small random offset when not privacy.
+    pub fn set_map_position_from_llh(&mut self) {
+        const PRECISION: f64 = 20.0;
+        if self.privacy {
+            self.map_lat = None;
+            self.map_lon = None;
+            self.map_alt = None;
+            return;
+        }
+        let mut rng = rand::thread_rng();
+        let off_x = -1.0 / PRECISION + (1.0 / PRECISION) * rng.gen::<f64>();
+        let off_y = -1.0 / PRECISION + (1.0 / PRECISION) * rng.gen::<f64>();
+        let lat = (self.position_llh[0] * PRECISION).round() / PRECISION + off_x;
+        let lon = (self.position_llh[1] * PRECISION).round() / PRECISION + off_y;
+        self.map_lat = Some((lat * 100.0).round() / 100.0);
+        self.map_lon = Some((lon * 100.0).round() / 100.0);
+        self.map_alt = Some(50.0 * (self.position_llh[2] / 50.0).round());
     }
     
     /// Increment clock jump counter and potentially trigger reset
@@ -469,5 +490,33 @@ mod tests {
         assert!(r1 < r2);
         assert!(r2 > r1);
         assert_eq!(r1, r1);
+    }
+
+    #[test]
+    fn test_set_map_position_from_llh_privacy() {
+        let mut receiver = Receiver::new(
+            1, "test".to_string(), None, "dump1090",
+            [37.5, -122.0, 100.0], true, "test".to_string(), 0.0
+        );
+        receiver.set_map_position_from_llh();
+        assert!(receiver.map_lat.is_none());
+        assert!(receiver.map_lon.is_none());
+        assert!(receiver.map_alt.is_none());
+    }
+
+    #[test]
+    fn test_set_map_position_from_llh_non_privacy() {
+        let mut receiver = Receiver::new(
+            1, "test".to_string(), None, "dump1090",
+            [37.5, -122.0, 100.0], false, "test".to_string(), 0.0
+        );
+        receiver.set_map_position_from_llh();
+        let lat = receiver.map_lat.unwrap();
+        let lon = receiver.map_lon.unwrap();
+        let alt = receiver.map_alt.unwrap();
+        // Fudge is ±1/20 = ±0.05; rounded to 2 decimals
+        assert!((lat - 37.5).abs() <= 0.06, "lat {} near 37.5", lat);
+        assert!((lon - (-122.0)).abs() <= 0.06, "lon {} near -122", lon);
+        assert_eq!(alt, 100.0); // 50 * round(100/50)
     }
 }

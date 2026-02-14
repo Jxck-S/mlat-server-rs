@@ -170,6 +170,7 @@ impl Coordinator {
         if user.starts_with(DEBUG_FOCUS) {
             receiver.focus = true;
         }
+        receiver.set_map_position_from_llh();
 
         println!("Created receiver {}: user={} position=[{}, {}, {}]",
                  receiver_id, user, lat, lon, alt);
