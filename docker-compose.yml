@@ -11,7 +11,9 @@ services:
     ports:
       - "31090:31090"   # Client input (Beast/Raw)
       - "30104:30104"   # BaseStation output
-      - "8080:8080"     # HTTP File Server (sync.json, clients.json, etc) - reserved for future use
+      - "8080:8080"     # HTTP file server (work-dir JSON: sync.json, clients.json, aircraft.json)
+    # Run as root so the work-dir volume is always writable (optional; default is user mlat)
+    # user: root
     # Persist work dir (sync.json, clients.json, aircraft.json) on the host
     volumes:
       - ./work:/run/mlat-server-rs

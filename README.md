@@ -69,7 +69,41 @@ docker compose up -d
 ```
 
 - **Dockerfile**: Multi-stage build using `rust:1-bookworm` for compilation and `debian:bookworm-slim` for runtime. The binary runs as a non-root user with `WORK_DIR` at `/run/mlat-server-rs`.
-- **docker-compose.yml**: Exposes client port 31090, basestation 30104, and 8080 (reserved). Ulimits are set for high concurrency; override `command` or environment as needed.
+- **docker-compose.yml**: Exposes client port 31090, basestation 30104, and 8080 (HTTP file server). Ulimits are set for high concurrency; override `command` or environment as needed.
+
+### Optional HTTP server (work-dir JSON files)
+
+If the environment variable `HTTP_PORT` is set, the server starts a simple HTTP file server on that port serving the **work directory** (e.g. `sync.json`, `clients.json`, `aircraft.json`). In Docker Compose this is enabled with `HTTP_PORT=8080`. No separate process is needed; it runs inside the same binary.
+
+### Work directory and permissions
+
+The server writes state files (e.g. `sync.json`, `clients.json`, `aircraft.json`) into `--work-dir`. In Docker you typically bind-mount a host directory so data persists and you can access the files.
+
+- **Create and use a host directory**  
+  Example: mount `./work` into the container’s work dir:
+
+  ```yaml
+  volumes:
+    - ./work:/run/mlat-server-rs
+  ```
+
+  Ensure the directory exists (e.g. `mkdir -p work`) and that the container user can write to it (see below).
+
+- **Running as non-root (default)**  
+  The image runs as user `mlat` (non-root). The Dockerfile creates `/run/mlat-server-rs` and sets ownership to `mlat:mlat`. If you mount a host path (e.g. `./work:/run/mlat-server-rs`), that directory must be writable by the container’s user. Options:
+
+  - **Match host UID/GID**: Create the host directory with the same UID/GID as the `mlat` user in the image (e.g. from the Dockerfile, or inspect with `docker run --rm --entrypoint id <image>`).
+  - **Open permissions**: e.g. `chmod 777 work` (not recommended on shared systems).
+  - **Run once as root** to create the dir and chown it to the desired UID/GID, then run as that user.
+
+- **Running as root**  
+  To run the container as root (e.g. to avoid permission issues with an existing host directory):
+
+  ```yaml
+  user: root
+  ```
+
+  Or override at run time: `docker run --user root ...`. The server will create and write to `--work-dir` as root. Only do this if you understand the security implications.
 
 ## Project layout
 

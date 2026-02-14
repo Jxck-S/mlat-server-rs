@@ -29,9 +29,11 @@ RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
 # Work directory for state files (sync.json, clients.json, aircraft.json)
 ENV WORK_DIR=/run/mlat-server-rs
+# Optional: port for HTTP file server (work-dir JSON files). Set to 8080 to enable.
+ENV HTTP_PORT=8080
 RUN mkdir -p "$WORK_DIR" && chown -R mlat:mlat "$WORK_DIR"
 
-# Default ports: client (Beast/Raw), basestation, HTTP (if added later)
+# Default ports: client (Beast/Raw), basestation, HTTP file server
 EXPOSE 31090 30104 8080
 
 USER mlat

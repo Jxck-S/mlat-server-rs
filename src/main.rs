@@ -10,6 +10,7 @@ use std::sync::Arc;
 use tokio::signal;
 use clap::Parser;
 use tracing::{info, error, warn};
+use tower_http::services::ServeDir;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -29,7 +30,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ));
     coordinator.init_work_dir().await;
     info!("Coordinator initialized");
-    
+
+    // Optional: HTTP server to expose work directory (JSON files: sync.json, clients.json, aircraft.json)
+    if let Ok(port_str) = std::env::var("HTTP_PORT") {
+        if let Ok(port) = port_str.parse::<u16>() {
+            let work_dir = config.work_dir.clone();
+            tokio::spawn(async move {
+                let listener = match tokio::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, port)).await {
+                    Ok(l) => l,
+                    Err(e) => {
+                        error!("HTTP server failed to bind to port {}: {}", port, e);
+                        return;
+                    }
+                };
+                info!("HTTP server on port {} serving {}", port, work_dir);
+                let app = axum::Router::new().nest_service("/", ServeDir::new(work_dir));
+                if let Err(e) = axum::serve(listener, app).await {
+                    error!("HTTP server error: {}", e);
+                }
+            });
+        }
+    }
+
     // Spawn periodic tasks for coordinator
     let coordinator_clone = coordinator.clone();
     tokio::spawn(async move {
