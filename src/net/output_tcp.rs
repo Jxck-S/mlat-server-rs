@@ -24,21 +24,42 @@ pub async fn run_tcp_connect_output(
         match TcpStream::connect(&addr).await {
             Ok(mut stream) => {
                 info!("Connected to {} output at {}", output_type, addr);
-                
+                const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+                let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
                 loop {
-                    match rx.recv().await {
-                        Ok(msg) => {
-                            if let Err(e) = stream.write_all(&msg).await {
-                                error!("Failed to write to {}: {}", addr, e);
-                                break; // Reconnect
+                    tokio::select! {
+                        result = rx.recv() => {
+                            match result {
+                                Ok(msg) => {
+                                    if let Err(e) = stream.write_all(&msg).await {
+                                        error!("Failed to write to {}: {}", addr, e);
+                                        break;
+                                    }
+                                    if let Err(e) = stream.flush().await {
+                                        error!("Failed to flush to {}: {}", addr, e);
+                                        break;
+                                    }
+                                }
+                                Err(broadcast::error::RecvError::Lagged(count)) => {
+                                    warn!("Output client lagged by {} messages", count);
+                                }
+                                Err(broadcast::error::RecvError::Closed) => {
+                                    info!("Output channel closed");
+                                    return;
+                                }
                             }
                         }
-                        Err(broadcast::error::RecvError::Lagged(count)) => {
-                            warn!("Output client lagged by {} messages", count);
-                        }
-                        Err(broadcast::error::RecvError::Closed) => {
-                            info!("Output channel closed");
-                            return;
+                        _ = interval.tick() => {
+                            if let Err(e) = stream.write_all(b"\n").await {
+                                error!("Failed to send heartbeat to {}: {}", addr, e);
+                                break;
+                            }
+                            if let Err(e) = stream.flush().await {
+                                error!("Failed to flush heartbeat to {}: {}", addr, e);
+                                break;
+                            }
                         }
                     }
                 }
@@ -78,22 +99,39 @@ pub async fn run_tcp_listen_output(
                         info!("Accepted {} client connection from {}", output_type, peer_addr);
                         let mut client_rx = rx.subscribe();
                         
-                        // Spawn task for this client
+                        // Spawn task for this client (heartbeat every 30s like Python BasestationClient)
                         tokio::spawn(async move {
+                            const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+                            let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
+                            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
                             loop {
-                                match client_rx.recv().await {
-                                    Ok(msg) => {
-                                        if let Err(e) = stream.write_all(&msg).await {
-                                            // Client disconnected
-                                            info!("Client {} disconnected: {}", peer_addr, e);
-                                            break;
+                                tokio::select! {
+                                    result = client_rx.recv() => {
+                                        match result {
+                                            Ok(msg) => {
+                                                if let Err(e) = stream.write_all(&msg).await {
+                                                    info!("Client {} disconnected: {}", peer_addr, e);
+                                                    break;
+                                                }
+                                                if let Err(e) = stream.flush().await {
+                                                    info!("Client {} flush error: {}", peer_addr, e);
+                                                    break;
+                                                }
+                                            }
+                                            Err(broadcast::error::RecvError::Lagged(_)) => {}
+                                            Err(broadcast::error::RecvError::Closed) => break,
                                         }
                                     }
-                                    Err(broadcast::error::RecvError::Lagged(_)) => {
-                                        // Skip
-                                    }
-                                    Err(broadcast::error::RecvError::Closed) => {
-                                        break;
+                                    _ = interval.tick() => {
+                                        if let Err(e) = stream.write_all(b"\n").await {
+                                            info!("Client {} heartbeat write error: {}", peer_addr, e);
+                                            break;
+                                        }
+                                        if let Err(e) = stream.flush().await {
+                                            info!("Client {} heartbeat flush error: {}", peer_addr, e);
+                                            break;
+                                        }
                                     }
                                 }
                             }
