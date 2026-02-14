@@ -165,6 +165,23 @@ The server writes state files (e.g. `sync.json`, `clients.json`, `aircraft.json`
 
   Or override at run time: `docker run --user root ...`. The server will create and write to `--work-dir` as root. Only do this if you understand the security implications.
 
+## Development tools (receiving and mapping SBS output)
+
+For local development and testing you can pipe this server’s Basestation (SBS) output into [readsb](https://github.com/wiedehopf/readsb) and then view positions on a map with [tar1090](https://github.com/wiedehopf/tar1090).
+
+- **readsb** receives MLAT results from this server (e.g. over SBS), merges them with live ADS-B, and can write JSON and Beast output for display.
+- **tar1090** is a web UI that consumes the data readsb produces (e.g. `aircraft.json`, history) and shows aircraft on a map.
+
+Typical flow:
+
+1. Run mlat-server with a Basestation listen port, e.g.  
+   `--basestation-listen 30003`
+2. Run readsb so it connects to that SBS stream, e.g.  
+   `--net-connector 127.0.0.1,30003,sbs_in` (plus your usual readsb options: `--net`, `--write-json`, etc.).
+3. Install and run tar1090 pointing at the same data directory readsb uses; open the tar1090 page in a browser to see MLAT and ADS-B traffic on the map.
+
+See the [readsb](https://github.com/wiedehopf/readsb) and [tar1090](https://github.com/wiedehopf/tar1090) repositories for build, install, and configuration details.
+
 ## Project layout
 
 - `src/` — Rust server (modes, solver, network, coordinator).

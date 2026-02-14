@@ -144,18 +144,48 @@ impl JsonClient {
     ///
     /// Returns true if handshake succeeded, false if it failed.
     /// Accepts flat handshake format (no "type" field) as sent by mlat-client and test client.
+    /// If the first line starts with "PROXY " (HAProxy etc.), parses client IP/port and uses the next line as handshake (Python parity).
     async fn process_handshake(&mut self) -> io::Result<bool> {
-        // Read handshake with timeout
-        let line = match time::timeout(
+        // Read first line with timeout
+        let mut line = match time::timeout(
             Duration::from_secs(15),
             self.connection.read_line()
         ).await {
-            Ok(Ok(line)) => line,
+            Ok(Ok(l)) => l,
             Ok(Err(e)) => return Err(e),
             Err(_) => {
                 eprintln!("Handshake failed: timeout");
                 return Ok(false);
             }
+        };
+
+        // Python: if line.startswith('PROXY '), parse source IP/port and read next line as handshake
+        let proxy_source: Option<(String, u16)> = if line.starts_with("PROXY ") {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 5 {
+                let ip = parts[2].to_string();
+                if let Ok(port) = parts[4].parse::<u16>() {
+                    let next_line = match time::timeout(
+                        Duration::from_secs(15),
+                        self.connection.read_line()
+                    ).await {
+                        Ok(Ok(l)) => l,
+                        Ok(Err(e)) => return Err(e),
+                        Err(_) => {
+                            eprintln!("Handshake failed: timeout after PROXY");
+                            return Ok(false);
+                        }
+                    };
+                    line = next_line;
+                    Some((ip, port))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
         };
 
         self.coordinator.log_handshake(&line).await;
@@ -231,8 +261,12 @@ impl JsonClient {
 
         self.receiver_id = Some(receiver_id);
         self.connection.set_receiver_id(receiver_id);
-        let peer = self.connection.peer_addr();
-        self.coordinator.set_receiver_source(receiver_id, peer.ip().to_string(), peer.port()).await;
+        let (source_ip, source_port) = proxy_source
+            .unwrap_or_else(|| {
+                let peer = self.connection.peer_addr();
+                (peer.ip().to_string(), peer.port())
+            });
+        self.coordinator.set_receiver_source(receiver_id, source_ip, source_port).await;
 
         eprintln!("Handshake successful ({})", connection_info);
 
@@ -372,6 +406,16 @@ impl JsonClient {
                 }
                 return Ok(());
             }
+        }
+
+        // Python: elif 'heartbeat' in msg: self.process_heartbeat_message(msg['heartbeat']) (no-op)
+        if obj.get("heartbeat").is_some() {
+            return Ok(());
+        }
+
+        // Python: elif 'quine' in msg: self.process_quine_message(msg['quine']) — accept and no-op for parity
+        if obj.get("quine").is_some() {
+            return Ok(());
         }
 
         eprintln!("Unknown message format: {}", line);
