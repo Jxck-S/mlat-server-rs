@@ -59,6 +59,18 @@ Or run the built binary:
   --verbose
 ```
 
+## Docker
+
+Build and run with Docker Compose (Rust is installed only in the build stage; the running image is minimal Debian):
+
+```bash
+docker compose build
+docker compose up -d
+```
+
+- **Dockerfile**: Multi-stage build using `rust:1-bookworm` for compilation and `debian:bookworm-slim` for runtime. The binary runs as a non-root user with `WORK_DIR` at `/run/mlat-server-rs`.
+- **docker-compose.yml**: Exposes client port 31090, basestation 30104, and 8080 (reserved). Ulimits are set for high concurrency; override `command` or environment as needed.
+
 ## Project layout
 
 - `src/` — Rust server (modes, solver, network, coordinator).

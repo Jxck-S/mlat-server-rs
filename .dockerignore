@@ -1,0 +1,32 @@
+# Build output
+target/
+
+# Git
+.git
+.gitignore
+
+# IDE / work dirs (not needed in image)
+.gemini
+.cursor
+.vscode
+.work
+.work-rust
+.work-python
+.venv
+__pycache__
+*.pyc
+
+# Python reference (not needed to build Rust binary)
+python-mlat-server/
+pykalman-source/
+
+# Docs and tests (not needed in image)
+docs
+tests
+test_data
+tools
+*.md
+!README.md
+
+# OS
+.DS_Store
