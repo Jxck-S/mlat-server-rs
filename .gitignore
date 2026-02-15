@@ -10,6 +10,12 @@
 .work/
 .work-rust/
 .work-python/
+readsb-json/
+readsb/.env
+work
+scripts
+readsb
+*.pcap
 
 # Docs and internal (do not commit)
 .github/

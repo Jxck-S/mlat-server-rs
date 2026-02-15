@@ -80,11 +80,13 @@ impl TcpServer {
         }
     }
     
-    /// Start server with coordinator integration
+    /// Start server with coordinator integration.
+    /// If optional_udp is Some(host, port), handshake will include udp_transport so clients can send sync/mlat over UDP.
     pub async fn start_with_coordinator(
         addr: SocketAddr,
         coordinator: std::sync::Arc<crate::coordinator::Coordinator>,
         motd: String,
+        optional_udp: super::json_client::OptionalUdp,
     ) -> io::Result<Self> {
         let listener = TcpListener::bind(addr).await?;
         let local_addr = listener.local_addr()?;
@@ -98,9 +100,10 @@ impl TcpServer {
                             Ok((stream, peer_addr)) => {
                                 let coordinator = std::sync::Arc::clone(&coordinator);
                                 let motd = motd.clone();
+                                let optional_udp = optional_udp.clone();
                                 tokio::spawn(async move {
                                     let connection = super::connection::Connection::new(stream, peer_addr);
-                                    let mut client = super::json_client::JsonClient::new(connection, motd, coordinator);
+                                    let mut client = super::json_client::JsonClient::new(connection, motd, coordinator, optional_udp);
                                     if let Err(e) = client.run().await {
                                         eprintln!("Client error from {}: {}", peer_addr, e);
                                     }
@@ -134,7 +137,7 @@ impl Drop for TcpServer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
     
     #[tokio::test]
     async fn test_tcp_server_start() {
@@ -156,7 +159,9 @@ mod tests {
         
         let server = TcpServer::start(addr, move |_conn| {
             let _ = tx.try_send(());
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
         
         let server_addr = server.addr();
         

@@ -10,7 +10,6 @@ use tokio::sync::{RwLock, mpsc};
 use tokio::io::AsyncWriteExt;
 
 use crate::constants::{MTOF, MLAT_DELAY};
-use crate::mlattrack::MlatAction;
 
 /// Username prefix for debug/focus logging (Python config.DEBUG_FOCUS). Receivers with user starting with this get focus=true.
 const DEBUG_FOCUS: &str = "euerdorf";
@@ -23,6 +22,8 @@ pub struct Coordinator {
     receivers: Arc<RwLock<HashMap<usize, crate::receiver::Receiver>>>,
     /// Map username -> receiver_id so we enforce one connection per user (Python: usernames)
     usernames: Arc<RwLock<HashMap<String, usize>>>,
+    /// Map UDP key -> receiver_id for UDP transport (Python: udp_protocol.add_client returns key)
+    udp_keys: Arc<RwLock<HashMap<u32, usize>>>,
     tracker: Arc<RwLock<crate::tracker::Tracker>>,
     mlat_tracker: Arc<RwLock<crate::mlattrack::MlatTracker>>,
     clock_tracker: Arc<RwLock<crate::clocktrack::ClockTracker>>,
@@ -63,6 +64,7 @@ impl Coordinator {
         Coordinator {
             receivers: Arc::new(RwLock::new(HashMap::new())),
             usernames: Arc::new(RwLock::new(HashMap::new())),
+            udp_keys: Arc::new(RwLock::new(HashMap::new())),
             tracker: Arc::new(RwLock::new(crate::tracker::Tracker::new(0, 1))),
             mlat_tracker: Arc::new(RwLock::new(crate::mlattrack::MlatTracker::new())),
             clock_tracker: Arc::new(RwLock::new(crate::clocktrack::ClockTracker::new())),
@@ -143,6 +145,42 @@ impl Coordinator {
         }
     }
 
+    /// Register a UDP transport key for a receiver (Python: udp_protocol.add_client).
+    pub async fn register_udp_key(&self, key: u32, receiver_id: usize) {
+        self.udp_keys.write().await.insert(key, receiver_id);
+    }
+
+    /// Look up receiver ID by UDP key. Caller should remove key on disconnect (Python: remove_client).
+    pub async fn get_receiver_id_for_udp_key(&self, key: u32) -> Option<usize> {
+        self.udp_keys.read().await.get(&key).copied()
+    }
+
+    /// Remove UDP key when client disconnects (so UDP packets with that key are ignored).
+    pub async fn unregister_udp_key(&self, key: u32) {
+        self.udp_keys.write().await.remove(&key);
+    }
+
+    /// Diagnostics: record that a JSON message was received (for message rate / stats).
+    pub async fn record_message_received(&self) {
+        // Could increment a counter for status output; no-op for now.
+        let _ = self;
+    }
+
+    /// Diagnostics: record that a line contained "sync" (for sync parse debugging).
+    pub async fn record_line_containing_sync(&self) {
+        let _ = self;
+    }
+
+    /// Diagnostics: record that the "sync" key was seen in a message.
+    pub async fn record_sync_key_seen(&self) {
+        let _ = self;
+    }
+
+    /// Diagnostics: record that sync payload parse failed.
+    pub async fn record_sync_parse_fail(&self) {
+        let _ = self;
+    }
+
     /// Create a new receiver from handshake.
     ///
     /// Returns the receiver ID, or Err if this username is already connected (Python: one connection per user).
@@ -157,6 +195,7 @@ impl Coordinator {
         uuid: Option<String>,
         privacy: bool,
         connection_info: String,
+        return_stats: bool,
     ) -> Result<usize, String> {
         if self.usernames.read().await.contains_key(&user) {
             return Err(format!("User {} is already connected", user));
@@ -181,6 +220,7 @@ impl Coordinator {
             privacy,
             connection_info.clone(),
             now,
+            return_stats,
         );
         if user.starts_with(DEBUG_FOCUS) {
             receiver.focus = true;
@@ -206,7 +246,7 @@ impl Coordinator {
         receiver_id: usize,
         timestamp: f64,
         message_hex: &str,
-        utc: f64,
+        _utc: f64,
     ) {
         *self.total_mlat_messages.write().await += 1;
         // Server Unix time for "last seen" and MLAT wanted (match Python time.time())
@@ -253,20 +293,9 @@ impl Coordinator {
         tracker.update_mlat_wanted(now_unix);
 
         // 5. MLAT Processing (Python: receiver_mlat adds to cohort; resolution after MLAT_DELAY)
-        let receivers = self.receivers.read().await;
         let mut mlat_tracker = self.mlat_tracker.write().await;
-        let clock_tracker = self.clock_tracker.read().await;
 
-        if let Some(MlatAction::Delayed(icao)) = mlat_tracker.process_message(
-            receiver_id,
-            bytes,
-            timestamp,
-            utc,
-            icao,
-            &receivers,
-            &mut tracker,
-            &clock_tracker,
-        ) {
+        if mlat_tracker.process_message(receiver_id, bytes, timestamp).is_some() {
             self.add_icao_to_cohort(icao).await;
         }
         
@@ -327,11 +356,7 @@ impl Coordinator {
             let result = {
                 let mut mlat_tracker = self.mlat_tracker.write().await;
                 let mut tracker = self.tracker.write().await;
-                let ac = match tracker.get_mut(icao) {
-                    Some(a) => a,
-                    None => continue,
-                };
-                mlat_tracker.try_resolve_pending(icao, &receivers, ac, &clock_tracker, now)
+                mlat_tracker.try_resolve_pending(icao, &receivers, &mut tracker, &clock_tracker, now)
             };
             if let Some(ref result) = result {
                 self.forward_results(result).await;

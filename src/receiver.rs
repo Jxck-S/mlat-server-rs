@@ -65,6 +65,9 @@ pub struct Receiver {
 
     /// Messages received since last write_state (Python: connection.message_counter). Used for message_rate = counter/15.
     pub message_counter: u32,
+
+    /// If true, server sends stats message every 15s (Python: connection.return_stats).
+    pub return_stats: bool,
 }
 
 impl Receiver {
@@ -78,6 +81,7 @@ impl Receiver {
         privacy: bool,
         connection_info: String,
         now: f64,
+        return_stats: bool,
     ) -> Self {
         let position_tuple = geodesy::llh2ecef(position_llh[0], position_llh[1], position_llh[2]);
         let position = [position_tuple.0, position_tuple.1, position_tuple.2];
@@ -134,6 +138,7 @@ impl Receiver {
             map_alt: None,
             last_rate_report: None,
             message_counter: 0,
+            return_stats,
         }
     }
 
@@ -178,18 +183,35 @@ impl Receiver {
         self.clock_reset_counter += 1;
     }
     
-    /// Update interest sets and return (start, stop) lists for traffic request
+    /// Update interest sets and return (start, stop) lists for traffic request.
+    /// Mirrors Python receiver.update_interest_sets + refresh_traffic_requests.
+    /// Python: requested = sync_interest | mlat_interest (NOT including adsb_seen).
+    /// Python: if bad_syncs > 3 and len(new_sync) > 3: new_sync = random.sample(new_sync, 3)
+    /// Python: if bad_syncs > 0: new_mlat = set()
     pub fn update_interest_sets(
         &mut self,
-        new_sync: HashSet<u32>,
-        new_mlat: HashSet<u32>,
+        mut new_sync: HashSet<u32>,
+        mut new_mlat: HashSet<u32>,
         new_adsb: HashSet<u32>,
     ) -> (Vec<u32>, Vec<u32>) {
+        // Python: bad_syncs filtering (coordinator.py L102-106)
+        if self.bad_syncs > 3.0 && new_sync.len() > 3 {
+            use rand::seq::IteratorRandom;
+            let sampled: HashSet<u32> = new_sync.iter().copied()
+                .choose_multiple(&mut rand::thread_rng(), 3)
+                .into_iter().collect();
+            new_sync = sampled;
+        }
+        if self.bad_syncs > 0.0 {
+            new_mlat = HashSet::new();
+        }
+
         self.sync_interest = new_sync.clone();
         self.mlat_interest = new_mlat.clone();
-        self.adsb_seen = new_adsb.clone();
+        self.adsb_seen = new_adsb;
 
-        let new_requested = &(&new_sync | &new_mlat) | &new_adsb;
+        // Python: requested = sync_interest | mlat_interest (refresh_traffic_requests)
+        let new_requested: HashSet<u32> = &new_sync | &new_mlat;
         
         let start: Vec<u32> = new_requested.difference(&self.requested).copied().collect();
         let stop: Vec<u32> = self.requested.difference(&new_requested).copied().collect();
@@ -300,6 +322,7 @@ mod tests {
             false,
             "test connection".to_string(),
             now,
+            false,
         );
         
         assert_eq!(receiver.uid, 1);
@@ -328,6 +351,7 @@ mod tests {
             false,
             "test".to_string(),
             0.0,
+            false,
         );
         
         assert_eq!(receiver.epoch, Some("gps_midnight".to_string()));
@@ -360,15 +384,15 @@ mod tests {
         // Create 3 receivers at different positions
         let r1 = Receiver::new(
             1, "r1".to_string(), None, "dump1090",
-            [37.0, -122.0, 0.0], false, "r1".to_string(), 0.0
+            [37.0, -122.0, 0.0], false, "r1".to_string(), 0.0, false
         );
         let r2 = Receiver::new(
             2, "r2".to_string(), None, "dump1090",
-            [38.0, -122.0, 0.0], false, "r2".to_string(), 0.0
+            [38.0, -122.0, 0.0], false, "r2".to_string(), 0.0, false
         );
         let r3 = Receiver::new(
             3, "r3".to_string(), None, "dump1090",
-            [37.0, -121.0, 0.0], false, "r3".to_string(), 0.0
+            [37.0, -121.0, 0.0], false, "r3".to_string(), 0.0, false
         );
         
         receivers.insert(1, r1);
@@ -405,11 +429,11 @@ mod tests {
         // Start with 2 receivers
         let r1 = Receiver::new(
             1, "r1".to_string(), None, "dump1090",
-            [37.0, -122.0, 0.0], false, "r1".to_string(), 0.0
+            [37.0, -122.0, 0.0], false, "r1".to_string(), 0.0, false
         );
         let r2 = Receiver::new(
             2, "r2".to_string(), None, "dump1090",
-            [38.0, -122.0, 0.0], false, "r2".to_string(), 0.0
+            [38.0, -122.0, 0.0], false, "r2".to_string(), 0.0, false
         );
         
         receivers.insert(1, r1);
@@ -419,7 +443,7 @@ mod tests {
         // Add a third receiver
         let r3 = Receiver::new(
             3, "r3".to_string(), None, "dump1090",
-            [37.0, -121.0, 0.0], false, "r3".to_string(), 0.0
+            [37.0, -121.0, 0.0], false, "r3".to_string(), 0.0, false
         );
         receivers.insert(3, r3);
         update_distance_matrix(&mut receivers, 3);
@@ -443,7 +467,7 @@ mod tests {
     fn test_increment_jumps() {
         let mut receiver = Receiver::new(
             1, "test".to_string(), None, "dump1090",
-            [0.0, 0.0, 0.0], false, "test".to_string(), 0.0
+            [0.0, 0.0, 0.0], false, "test".to_string(), 0.0, false
         );
         
         receiver.sync_peers = [2, 2, 2, 2, 2];  // 10 total peers
@@ -468,7 +492,7 @@ mod tests {
     fn test_reset_clock() {
         let mut receiver = Receiver::new(
             1, "test".to_string(), None, "dump1090",
-            [0.0, 0.0, 0.0], false, "test".to_string(), 1000.0
+            [0.0, 0.0, 0.0], false, "test".to_string(), 1000.0, false
         );
         
         assert_eq!(receiver.last_clock_reset, 1000.0);
@@ -484,11 +508,11 @@ mod tests {
     fn test_receiver_ordering() {
         let r1 = Receiver::new(
             1, "r1".to_string(), None, "dump1090",
-            [0.0, 0.0, 0.0], false, "r1".to_string(), 0.0
+            [0.0, 0.0, 0.0], false, "r1".to_string(), 0.0, false
         );
         let r2 = Receiver::new(
             2, "r2".to_string(), None, "dump1090",
-            [0.0, 0.0, 0.0], false, "r2".to_string(), 0.0
+            [0.0, 0.0, 0.0], false, "r2".to_string(), 0.0, false
         );
         
         assert!(r1 < r2);
@@ -500,7 +524,7 @@ mod tests {
     fn test_set_map_position_from_llh_privacy() {
         let mut receiver = Receiver::new(
             1, "test".to_string(), None, "dump1090",
-            [37.5, -122.0, 100.0], true, "test".to_string(), 0.0
+            [37.5, -122.0, 100.0], true, "test".to_string(), 0.0, false
         );
         receiver.set_map_position_from_llh();
         assert!(receiver.map_lat.is_none());
@@ -512,7 +536,7 @@ mod tests {
     fn test_set_map_position_from_llh_non_privacy() {
         let mut receiver = Receiver::new(
             1, "test".to_string(), None, "dump1090",
-            [37.5, -122.0, 100.0], false, "test".to_string(), 0.0
+            [37.5, -122.0, 100.0], false, "test".to_string(), 0.0, false
         );
         receiver.set_map_position_from_llh();
         let lat = receiver.map_lat.unwrap();

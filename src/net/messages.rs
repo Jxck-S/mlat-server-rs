@@ -1,8 +1,19 @@
-// JSON message type definitions
-// Defines client ↔ server message protocol
+//! JSON message types and wire format for the client protocol.
+//!
+//! **Wire format must match the Python server exactly** (python-mlat-server/mlat/jsonclient.py).
+//! All server→client messages are flat JSON objects with no `"type"` field.
+//!
+//! Server sends:
+//! - Handshake: `{ "compress", "reconnect_in", "selective_traffic", "heartbeat", "return_results", "return_stats", "rate_reports", "motd" [, "udp_transport": [host, port, key] ] }`
+//! - Handshake error: `{ "deny": ["message"], "reconnect_in": N }`
+//! - Heartbeat: `{ "heartbeat": { "server_time": N } }`
+//! - Traffic: `{ "start_sending": ["icao6", ...] }` and/or `{ "stop_sending": ["icao6", ...] }`
+//! - Result: `{ "result": { "@", "addr", "lat", "lon", "alt", "callsign", "squawk", "hdop", "vdop", "tdop", "gdop", "nstations" } }`
+//!
+//! Client sends (we accept): handshake (flat), then `sync`, `mlat`, `seen`, `lost`, `rate_report`, `heartbeat`, etc. (wrapped or tag format).
 
 use std::collections::HashMap;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 /// Initial handshake as sent by clients (flat JSON, no "type" field).
 /// Matches Python mlat-client and test client format.
@@ -23,6 +34,12 @@ pub struct HandshakeRequest {
     pub privacy: bool,
     #[serde(default)]
     pub connection_info: Option<String>,
+    /// If true, client wants stats message every 15s (Python: return_stats).
+    #[serde(default)]
+    pub return_stats: Option<bool>,
+    /// Client requests UDP transport when == 2 (Python: hs.get('udp_transport', 0) == 2). Server only advertises udp_transport in response when this is Some(2).
+    #[serde(default)]
+    pub udp_transport: Option<u32>,
 }
 
 fn default_compress() -> Vec<String> {
@@ -84,87 +101,159 @@ pub enum ClientMessage {
     },
 }
 
-/// Messages sent from server to client
-#[derive(Debug, Serialize, Clone)]
-#[serde(tag = "type")]
+/// Messages sent from server to client (internal enum).
+/// Wire format must match Python: flat JSON objects with no "type" field.
+/// See server_message_to_wire() for the exact bytes sent.
+#[derive(Debug, Clone)]
 pub enum ServerMessage {
-    /// Handshake response
-    #[serde(rename = "handshake")]
+    /// Handshake response (sent as flat JSON in json_client, not via this enum on wire)
     Handshake {
         motd: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
         reconnect_in: Option<u32>,
-        #[serde(skip_serializing_if = "Option::is_none")]
         compress: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
         selective_traffic: Option<bool>,
-        #[serde(skip_serializing_if = "Option::is_none")]
         heartbeat: Option<bool>,
-        #[serde(skip_serializing_if = "Option::is_none")]
         return_results: Option<bool>,
+        return_stats: Option<bool>,
+        rate_reports: Option<bool>,
+        udp_transport: Option<(String, u16, u32)>,
     },
-    
-    /// Traffic filter request
-    #[serde(rename = "mlat_request")]
+    /// Traffic filter: on wire sent as {"start_sending": [...]} and/or {"stop_sending": [...]} (Python keys)
     TrafficRequest {
-        #[serde(skip_serializing_if = "Vec::is_empty")]
-        start: Vec<String>,  // ICAO addresses to start tracking
-        #[serde(skip_serializing_if = "Vec::is_empty")]
-        stop: Vec<String>,   // ICAO addresses to stop tracking
+        start: Vec<String>,
+        stop: Vec<String>,
     },
-    
-    /// MLAT result
-    #[serde(rename = "mlat_result")]
+    /// MLAT result (legacy path); on wire sent as {"result": {"@", "addr", "lat", ...}} (Python keys)
     MlatResult {
         icao: String,
         lat: f64,
         lon: f64,
         alt: f64,
-        #[serde(skip_serializing_if = "Option::is_none")]
         callsign: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
         squawk: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
         hdop: Option<f64>,
-        #[serde(skip_serializing_if = "Option::is_none")]
         vdop: Option<f64>,
-        #[serde(skip_serializing_if = "Option::is_none")]
         tdop: Option<f64>,
-        #[serde(skip_serializing_if = "Option::is_none")]
         gdop: Option<f64>,
-        #[serde(skip_serializing_if = "Option::is_none")]
         nstations: Option<usize>,
     },
-    
-    /// Heartbeat message
-    #[serde(rename = "heartbeat")]
-    Heartbeat {
-        server_time: f64,
+    /// Heartbeat: on wire sent as {"heartbeat": {"server_time": ...}}
+    Heartbeat { server_time: f64 },
+    /// Stats (every 15s when client asked for return_stats). Python: send(stats=statistics)
+    Stats {
+        peer_count: usize,
+        bad_sync_timeout: i64,
+        outlier_percent: f64,
     },
-    
-    /// MLAT result (for receiver clock tuning)
-    #[serde(rename = "position")]
+    /// MLAT result for forward_results: on wire sent as {"result": {"@", "addr", "lat", "lon", "alt", ...}}
     Position {
-        #[serde(rename = "@")]
         timestamp: f64,
         addr: String,
         lat: f64,
         lon: f64,
         alt: f64,
-        #[serde(skip_serializing_if = "Option::is_none")]
         callsign: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
         squawk: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
         hdop: Option<f64>,
-        #[serde(skip_serializing_if = "Option::is_none")]
         vdop: Option<f64>,
-        #[serde(skip_serializing_if = "Option::is_none")]
         tdop: Option<f64>,
-        #[serde(skip_serializing_if = "Option::is_none")]
         gdop: Option<f64>,
         nstations: usize,
     },
+}
+
+/// Convert ServerMessage to the exact flat JSON lines sent to the client (match Python wire format).
+/// Returns one or more JSON objects (e.g. TrafficRequest can yield two lines: start_sending, stop_sending).
+pub fn server_message_to_wire(msg: &ServerMessage) -> Vec<serde_json::Value> {
+    use ServerMessage::*;
+    let mut out = Vec::new();
+    match msg {
+        TrafficRequest { start, stop } => {
+            if !start.is_empty() {
+                out.push(serde_json::json!({ "start_sending": start }));
+            }
+            if !stop.is_empty() {
+                out.push(serde_json::json!({ "stop_sending": stop }));
+            }
+        }
+        Heartbeat { server_time } => {
+            let t = (server_time * 1000.0).round() / 1000.0;
+            out.push(serde_json::json!({ "heartbeat": { "server_time": t } }));
+        }
+        Stats { peer_count, bad_sync_timeout, outlier_percent } => {
+            out.push(serde_json::json!({
+                "stats": {
+                    "peer_count": peer_count,
+                    "bad_sync_timeout": bad_sync_timeout,
+                    "outlier_percent": outlier_percent,
+                }
+            }));
+        }
+        Position {
+            timestamp,
+            addr,
+            lat,
+            lon,
+            alt,
+            callsign,
+            squawk,
+            hdop,
+            vdop,
+            tdop,
+            gdop,
+            nstations,
+        } => {
+            let result = serde_json::json!({
+                "@": (timestamp * 1000.0).round() / 1000.0,
+                "addr": addr,
+                "lat": (lat * 100000.0).round() / 100000.0,
+                "lon": (lon * 100000.0).round() / 100000.0,
+                "alt": alt.round(),
+                "callsign": callsign,
+                "squawk": squawk,
+                "hdop": hdop.unwrap_or(0.0),
+                "vdop": vdop.unwrap_or(0.0),
+                "tdop": tdop.unwrap_or(0.0),
+                "gdop": gdop.unwrap_or(0.0),
+                "nstations": nstations,
+            });
+            out.push(serde_json::json!({ "result": result }));
+        }
+        MlatResult {
+            icao,
+            lat,
+            lon,
+            alt,
+            callsign,
+            squawk,
+            hdop,
+            vdop,
+            tdop,
+            gdop,
+            nstations,
+        } => {
+            let n = nstations.unwrap_or(0);
+            let result = serde_json::json!({
+                "@": 0_f64,
+                "addr": icao,
+                "lat": (lat * 100000.0).round() / 100000.0,
+                "lon": (lon * 100000.0).round() / 100000.0,
+                "alt": alt.round(),
+                "callsign": callsign,
+                "squawk": squawk,
+                "hdop": hdop.unwrap_or(0.0),
+                "vdop": vdop.unwrap_or(0.0),
+                "tdop": tdop.unwrap_or(0.0),
+                "gdop": gdop.unwrap_or(0.0),
+                "nstations": n,
+            });
+            out.push(serde_json::json!({ "result": result }));
+        }
+        Handshake { .. } => {
+            // Handshake is sent manually as flat JSON in process_handshake, not via channel
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -243,7 +332,8 @@ mod tests {
     }
     
     #[test]
-    fn test_serialize_handshake_response() {
+    fn test_wire_handshake_not_sent_via_enum() {
+        // Handshake is sent as flat JSON in process_handshake; server_message_to_wire returns empty for Handshake
         let msg = ServerMessage::Handshake {
             motd: "Welcome!".to_string(),
             reconnect_in: Some(300),
@@ -251,24 +341,62 @@ mod tests {
             selective_traffic: Some(true),
             heartbeat: Some(true),
             return_results: Some(true),
+            return_stats: Some(false),
+            rate_reports: Some(true),
+            udp_transport: None,
         };
-        
-        let json = serde_json::to_string(&msg).unwrap();
-        assert!(json.contains("\"type\":\"handshake\""));
-        assert!(json.contains("\"motd\":\"Welcome!\""));
-        assert!(json.contains("\"reconnect_in\":300"));
+        let wire = server_message_to_wire(&msg);
+        assert!(wire.is_empty());
     }
-    
+
     #[test]
-    fn test_serialize_traffic_request() {
+    fn test_wire_traffic_request_flat_format() {
         let msg = ServerMessage::TrafficRequest {
-            start: vec!["ABC123".to_string(), "DEF456".to_string()],
-            stop: vec!["789GHI".to_string()],
+            start: vec!["abc123".to_string(), "def456".to_string()],
+            stop: vec!["789abc".to_string()],
         };
-        
-        let json = serde_json::to_string(&msg).unwrap();
-        assert!(json.contains("\"type\":\"mlat_request\""));
-        assert!(json.contains("\"start\""));
-        assert!(json.contains("ABC123"));
+        let wire = server_message_to_wire(&msg);
+        assert_eq!(wire.len(), 2);
+        assert!(wire[0].get("start_sending").is_some());
+        assert!(wire[1].get("stop_sending").is_some());
+        let json0 = serde_json::to_string(&wire[0]).unwrap();
+        let json1 = serde_json::to_string(&wire[1]).unwrap();
+        assert!(!json0.contains("\"type\""));
+        assert!(json0.contains("abc123"));
+        assert!(json1.contains("789abc"));
+    }
+
+    #[test]
+    fn test_wire_heartbeat_flat_format() {
+        let msg = ServerMessage::Heartbeat { server_time: 123456.789 };
+        let wire = server_message_to_wire(&msg);
+        assert_eq!(wire.len(), 1);
+        assert!(wire[0].get("heartbeat").is_some());
+        assert_eq!(wire[0]["heartbeat"]["server_time"], 123456.789);
+    }
+
+    #[test]
+    fn test_wire_result_flat_format() {
+        let msg = ServerMessage::Position {
+            timestamp: 1000.5,
+            addr: "abc123".to_string(),
+            lat: 37.5,
+            lon: -122.0,
+            alt: 1000.0,
+            callsign: None,
+            squawk: None,
+            hdop: None,
+            vdop: None,
+            tdop: None,
+            gdop: None,
+            nstations: 4,
+        };
+        let wire = server_message_to_wire(&msg);
+        assert_eq!(wire.len(), 1);
+        let result = &wire[0]["result"];
+        assert_eq!(result["@"], 1000.5);
+        assert_eq!(result["addr"], "abc123");
+        assert_eq!(result["nstations"], 4);
+        assert!(!wire[0].to_string().contains("\"type\""));
     }
 }

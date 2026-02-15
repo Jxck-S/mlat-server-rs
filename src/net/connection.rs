@@ -2,7 +2,7 @@
 // Manages individual client connections
 
 use tokio::net::TcpStream;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 use std::net::SocketAddr;
 use std::io;
 
@@ -42,6 +42,15 @@ impl Connection {
         self.receiver_id = Some(id);
     }
     
+    /// Read exactly `buf.len()` bytes (for zlib packet framing)
+    pub async fn read_exact(&mut self, buf: &mut [u8]) -> io::Result<()> {
+        let n = self.reader.read_exact(buf).await?;
+        if n != buf.len() {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "read_exact: short read"));
+        }
+        Ok(())
+    }
+
     /// Read a line from the connection (JSON messages are line-delimited)
     pub async fn read_line(&mut self) -> io::Result<String> {
         let mut line = String::new();
@@ -73,12 +82,27 @@ impl Connection {
         self.writer.flush().await?;
         Ok(())
     }
+
+    /// Write a zlib2 frame: 2-byte big-endian length then payload (Python _flush_zlib format).
+    /// Caller must provide the compressed payload without the 4-byte Z_SYNC_FLUSH suffix.
+    pub async fn write_zlib2_frame(&mut self, payload: &[u8]) -> io::Result<()> {
+        let len = payload.len();
+        if len > 65535 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "zlib2 frame payload exceeds 65535 bytes",
+            ));
+        }
+        let len_be = (len as u16).to_be_bytes();
+        self.writer.write_all(&len_be).await?;
+        self.writer.write_all(payload).await?;
+        self.writer.flush().await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    
     #[test]
     fn test_connection_creation() {
         // Can't easily test without actual TCP connection

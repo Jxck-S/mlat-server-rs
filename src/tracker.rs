@@ -366,6 +366,11 @@ impl Tracker {
         }
     }
     
+    /// Number of tracked aircraft
+    pub fn aircraft_count(&self) -> usize {
+        self.aircraft.len()
+    }
+
     /// Check if an ICAO address belongs to this partition
     /// 
     /// Uses a hash function to distribute aircraft across partitions
@@ -608,10 +613,12 @@ impl Tracker {
 
             // 4. Build ratepair list (rp, other_receiver_id, icao, internal_rate)
             for (&icao, &rate) in rates {
-                let ac = match self.aircraft.get(&icao) {
+                let ac = match self.aircraft.get_mut(&icao) {
                     Some(a) => a,
                     None => continue,
                 };
+                // Python: ac.seen = now (tracker.py L236)
+                ac.seen = now;
                 new_adsb.insert(icao);
 
                 let alt_factor = if let Some(alt) = ac.altitude {
@@ -655,7 +662,13 @@ impl Tracker {
             ratepair_list.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
             
             let split = ratepair_list.len() / 2;
-            let first_half = &ratepair_list[..split];
+            // Python: random.shuffle(firstHalf) - shuffle top half before round 1
+            let mut first_half: Vec<_> = ratepair_list[..split].to_vec();
+            {
+                use rand::seq::SliceRandom;
+                first_half.shuffle(&mut rand::thread_rng());
+            }
+            let first_half = &first_half;
 
             let mut ntotal: HashMap<usize, f64> = HashMap::new();
             let mut total_rate = 0.0;
@@ -679,11 +692,9 @@ impl Tracker {
                 }
             }
 
-            // Round 2 (Python: ntotal.get(r1, 0.0) < 3.5; no sync_dont_use check in round 2)
+            // Round 2 (Python: ntotal.get(r1, 0.0) < 3.5; NO sync_dont_use check in round 2)
             for &(_rp, r1_id, icao, rate) in &ratepair_list {
                 if new_sync.contains(&icao) { continue; }
-                let ac = self.aircraft.get(&icao).unwrap();
-                if ac.sync_dont_use { continue; }
 
                 if total_rate > max_sync_rate { break; }
 

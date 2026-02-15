@@ -110,7 +110,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     coordinator.init_work_dir().await;
     info!("Coordinator initialized");
 
-    // Optional: HTTP server to expose work directory (JSON files: sync.json, clients.json, aircraft.json)
+    // Optional: HTTP server to expose work directory (JSON files: sync.json, clients.json, aircraft.json, stats.json, diagnostics.json)
     // Directory listing is enabled: requesting a directory shows an HTML index of its contents.
     if let Ok(port_str) = std::env::var("HTTP_PORT") {
         if let Ok(port) = port_str.parse::<u16>() {
@@ -177,10 +177,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let tcp_addr_str = format!("{}:{}", host, tcp_port);
         match tcp_addr_str.parse::<std::net::SocketAddr>() {
             Ok(addr) => {
+                let optional_udp = udp_port.and_then(|p| p.parse::<u16>().ok().map(|port| (host.to_string(), port)));
                 match TcpServer::start_with_coordinator(
                     addr,
                     coordinator.clone(),
                     mlat_server::config::expanded_motd(&config.motd),
+                    optional_udp,
                 ).await {
                     Ok(server) => {
                         eprintln!("JSON client handler listening on {} (TCP)", server.addr());

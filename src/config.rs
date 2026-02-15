@@ -74,6 +74,14 @@ pub struct Config {
     /// Verbose logging (DEBUG level)
     #[arg(long, short, default_value_t = false)]
     pub verbose: bool,
+
+    /// Do not advertise UDP in handshake; clients will send sync/mlat over TCP. Use when only TCP is forwarded (e.g. SSH reverse tunnel).
+    #[arg(long, default_value_t = false)]
+    pub no_udp: bool,
+
+    /// Advertise UDP transport in handshake when a UDP port is bound (--client-listen host:tcp:udp). By default UDP is not advertised so sync/mlat use TCP and work behind tunnels; set this to allow clients to send over UDP.
+    #[arg(long, default_value_t = false)]
+    pub advertise_udp: bool,
 }
 
 // Helper functions for parsing specific formats if needed, or implement TryFrom/FromStr on custom types.

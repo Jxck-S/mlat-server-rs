@@ -24,8 +24,8 @@ pub async fn run_tcp_connect_output(
         match TcpStream::connect(&addr).await {
             Ok(mut stream) => {
                 info!("Connected to {} output at {}", output_type, addr);
-                const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
-                let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
+                let heartbeat = Duration::from_secs(crate::constants::HEARTBEAT_INTERVAL_SECS);
+                let mut interval = tokio::time::interval(heartbeat);
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
                 loop {
@@ -101,8 +101,8 @@ pub async fn run_tcp_listen_output(
                         
                         // Spawn task for this client (heartbeat every 30s like Python BasestationClient)
                         tokio::spawn(async move {
-                            const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
-                            let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
+                            let heartbeat = Duration::from_secs(crate::constants::HEARTBEAT_INTERVAL_SECS);
+                            let mut interval = tokio::time::interval(heartbeat);
                             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
                             loop {

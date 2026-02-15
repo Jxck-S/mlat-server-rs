@@ -2,15 +2,16 @@
 // Ported from mlat/mlattrack.py
 
 use std::collections::{HashMap, HashSet};
-use tracing::debug;
 use crate::modes::message::{self, ModeSMessage, DecodedMessage};
 use crate::constants::{CAIR, FTOM, MAX_GROUP, RESOLVE_INTERVAL, RESOLVE_BACKOFF};
 
-/// Result of process_message: coordinator should schedule delayed resolution for this ICAO (Python: cohort MLAT_DELAY).
-#[derive(Debug, Clone, Copy)]
+/// Result of process_message: coordinator should schedule delayed resolution.
+/// Python: cohort groups resolved after MLAT_DELAY (0.9s).
+#[derive(Debug, Clone)]
 pub enum MlatAction {
-    /// Add to cohort; resolve after MLAT_DELAY (0.9s).
-    Delayed(u32),
+    /// New group created; schedule resolution after MLAT_DELAY (0.9s).
+    /// Contains the message bytes as the group key.
+    Delayed(Vec<u8>),
 }
 
 const MAX_TIMESTAMP_DELTA: f64 = 2e-3; // Maximum timestamp difference for clustering (2ms)
@@ -256,12 +257,24 @@ pub fn resolve(
     clock_tracker: &crate::clocktrack::ClockTracker,
     now: f64,
 ) -> Option<MlatResult> {
-        debug!(size = message_group.copies.len(), "Processing message group");
-
-        // Rate limiting (same as Python: mlattrack.py checks RESOLVE_INTERVAL and returns silently)
-        if now - aircraft.last_resolve_attempt < RESOLVE_INTERVAL {
-            return None;
+        // Per-failure-point counters
+        static RESOLVE_ENTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let re = RESOLVE_ENTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let copies = message_group.copies.len();
+        let rcvrs = message_group.receivers.len();
+        macro_rules! resolve_fail {
+            ($label:expr) => {{
+                static C: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+                let n = C.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if n < 3 || (re < 500 && n % 50 == 0) || n % 500 == 0 {
+                    eprintln!("resolve FAIL {}: copies={} rcvrs={} (#{} of {} entries)", $label, copies, rcvrs, n, re);
+                }
+                return None;
+            }};
         }
+
+        // Rate limiting is done by caller (try_resolve_pending_by_message).
+        // Set last_resolve_attempt to now so next call respects the interval.
     aircraft.last_resolve_attempt = now;
 
     // Elapsed and backoff (Python: last_result_time with 120s reset, elapsed, RESOLVE_BACKOFF checks)
@@ -275,18 +288,18 @@ pub fn resolve(
         elapsed = 0.0;
     }
     if elapsed < RESOLVE_BACKOFF {
-        return None;
+        resolve_fail!("backoff");
     }
     
     // Get altitude and altitude DOF
     let (altitude, altitude_dof) = get_altitude_from_group(message_group, aircraft);
     let len_copies = message_group.copies.len();
     if len_copies + altitude_dof < 4 {
-        return None;
+        resolve_fail!("copies+alt<4");
     }
     let max_dof = len_copies + altitude_dof - 4;
     if elapsed < 2.0 * RESOLVE_BACKOFF && (max_dof as f64) < (last_result_dof as f64 - elapsed + 0.5) {
-        return None;
+        resolve_fail!("dof_backoff");
     }
     
     // Build timestamp map
@@ -298,11 +311,11 @@ pub fn resolve(
     }
     let dof_pre = timestamp_map.len() + altitude_dof;
     if dof_pre < 4 {
-        return None;
+        resolve_fail!("ts_map<4");
     }
     let dof_pre = dof_pre - 4;
     if elapsed < 2.0 * RESOLVE_BACKOFF && (dof_pre as f64) < (last_result_dof as f64 - elapsed + 0.5) {
-        return None;
+        resolve_fail!("ts_dof_backoff");
     }
     
     // Normalize timestamps using graph-based clock synchronization
@@ -323,11 +336,19 @@ pub fn resolve(
     }
     
     if clusters.is_empty() {
-        debug!("No clusters found after clustering");
-        return None;
+        resolve_fail!("no_clusters");
     }
 
-    debug!(count = clusters.len(), "Found clusters");
+    {
+        static CLUSTER_OK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let ck = CLUSTER_OK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if ck < 5 || ck % 500 == 0 {
+            let total_m: usize = clusters.iter().map(|c| c.measurements.len()).sum();
+            let max_d = clusters.iter().map(|c| c.distinct).max().unwrap_or(0);
+            eprintln!("resolve: got {} clusters, max_distinct={}, total_meas={}, altitude={:?}, alt_dof={}, elapsed={:.1} (#{}))",
+                clusters.len(), max_d, total_m, altitude.map(|a| (a * 3.28084) as i32), altitude_dof, elapsed, ck);
+        }
+    }
     
     // Sort clusters (most recent, largest first)
     clusters.sort_by(|a, b| {
@@ -340,22 +361,40 @@ pub fn resolve(
     while let Some(cluster) = clusters.pop() {
         let dof = (cluster.distinct + altitude_dof).saturating_sub(4);
         
-        let elapsed = if let Some(last_time) = aircraft.last_result_time {
-            cluster.first_seen - last_time
-        } else {
-            1000.0
-        };
+        // Python line 280: elapsed = cluster_utc - last_result_time
+        // Use the local `last_result_time` (which has synthetic value first_seen-120
+        // for first results), NOT aircraft.last_result_time directly.
+        let cluster_elapsed = cluster.first_seen - last_result_time;
 
-        // Skip if DOF == 0 and stale
-        if elapsed > 30.0 && dof == 0 {
+        // Python line 283-284: dof backoff check
+        if cluster_elapsed < 2.0 && (dof as f64) < (last_result_dof as f64 - cluster_elapsed + 0.5) {
+            resolve_fail!("cluster_dof_backoff");
+        }
+
+        // Skip if DOF == 0 and stale (Python line 300-301)
+        if cluster_elapsed > 30.0 && dof == 0 {
             continue;
         }
         
         // Estimate altitude error
         let altitude_error = estimate_altitude_error(altitude, aircraft, cluster.first_seen);
         
-        // Get initial guess
-        let initial_guess = get_initial_guess(aircraft, elapsed, dof as isize);
+        // Python lines 303-306: initial guess selection
+        // When elapsed < 60 and we have a prior result, use it
+        // When elapsed >= 60 (including first-ever result), use first receiver's position
+        let initial_guess = if cluster_elapsed < 60.0 {
+            // Use Kalman or last result if available
+            if aircraft.kalman.valid {
+                aircraft.kalman.position
+            } else {
+                aircraft.last_result_position
+            }
+        } else {
+            // No recent result: use first receiver's position (Python: cluster[0][0].position)
+            cluster.measurements.first()
+                .and_then(|m| receivers.get(&m.receiver_id))
+                .map(|r| r.position)
+        };
         
         // Build measurements for solver
         let measurements: Vec<crate::solver::Measurement> = cluster.measurements.iter()
@@ -373,29 +412,42 @@ pub fn resolve(
         }
         
         // Solve for position
+        let has_guess = initial_guess.is_some();
         let solve_result = solve_position(
             &measurements,
             altitude,
             altitude_error,
             initial_guess,
         );
+
+        if solve_result.is_none() {
+            static SOLVE_FAIL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let sf = SOLVE_FAIL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if sf < 10 || sf % 200 == 0 {
+                eprintln!("resolve: solver returned None, distinct={} meas={} alt={:?} guess={} (#{}))",
+                    cluster.distinct, measurements.len(), altitude.is_some(), has_guess, sf);
+            }
+        }
         
         if let Some((ecef, ecef_cov)) = solve_result {
-            // Estimate error
+            // Estimate error (Python: var_est = numpy.trace(ecef_cov), error = sqrt(abs(var_est)))
             let var = if let Some(cov) = &ecef_cov {
-                (cov[(0, 0)] + cov[(1, 1)] + cov[(2, 2)]) / 3.0
+                // Python uses trace (sum of diagonal), NOT trace/3
+                (cov[(0, 0)] + cov[(1, 1)] + cov[(2, 2)]).abs()
             } else {
-                1e9
+                // Python: ecef_cov is None -> continue (reject suspect result)
+                continue;
             };
             
             let error = var.sqrt();
-            if error > 10000.0 {
+            let max_error = 10000.0;
+            if error > max_error {
                 continue;  // Try next cluster (max_error = 10km)
             }
 
             // Frequency capping: the higher the accuracy, the higher the frequency of positions that is output
-            let max_error = 10000.0;
-            if elapsed / 20.0 < error / max_error {
+            // Python line 338: elapsed / 20 < error / max_error  (uses cluster-level elapsed)
+            if cluster_elapsed / 20.0 < error / max_error {
                 continue;
             }
             
@@ -419,6 +471,16 @@ pub fn resolve(
             aircraft.last_result_time = Some(cluster.first_seen);
             aircraft.mlat_result_count += 1;
             
+            {
+                static SOLVE_OK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+                let sok = SOLVE_OK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if sok < 20 || sok % 100 == 0 {
+                    let (lat, lon, alt) = crate::geodesy::ecef2llh(ecef[0], ecef[1], ecef[2]);
+                    eprintln!("MLAT RESULT: icao={:06x} lat={:.4} lon={:.4} alt={:.0}ft err={:.0}m distinct={} dof={} (#{}))",
+                        aircraft.icao, lat, lon, alt * 3.28084, error, cluster.distinct, dof, sok);
+                }
+            }
+
             // Return result (include Kalman speed/vrate for SBS/CSV output)
             return Some(MlatResult {
                 icao: aircraft.icao,
@@ -474,16 +536,21 @@ fn get_altitude_from_group(
         };
 
         if let Some(alt_ft) = alt_opt {
-            return (Some(alt_ft as f64 * FTOM), 1);
+            // Python: decoded.altitude > -1500 and decoded.altitude < 75000
+            if alt_ft > -1500 && alt_ft < 75000 {
+                return (Some(alt_ft as f64 * FTOM), 1);
+            }
         }
     }
 
-    // Use aircraft's last known altitude if recent
+    // Use aircraft's last known altitude if recent (Python: last_altitude_time + 45 > first_seen)
+    // Also check altitude range (Python: MIN_ALT < altitude < MAX_ALT)
     if let Some(alt_ft) = aircraft.altitude {
-        if let Some(last_alt_time) = aircraft.last_altitude_time {
-            // Use altitude if less than 30 seconds old
-            if last_alt_time > 0.0 {
-                return (Some(alt_ft * FTOM), 0);
+        if alt_ft > crate::constants::MIN_ALT_M / FTOM && alt_ft < crate::constants::MAX_ALT_M / FTOM {
+            if let Some(last_alt_time) = aircraft.last_altitude_time {
+                if message_group.first_seen - last_alt_time < 45.0 {
+                    return (Some(alt_ft * FTOM), 0);
+                }
             }
         }
     }
@@ -513,7 +580,8 @@ fn estimate_altitude_error(
     }
 }
 
-/// Get initial guess for solver
+/// Get initial guess for solver (reserved for alternative code paths).
+#[allow(dead_code)]
 fn get_initial_guess(
     aircraft: &crate::tracker::TrackedAircraft,
     elapsed: f64,
@@ -626,85 +694,192 @@ fn get_receiver_distance(
 
 
 /// MLAT Tracker
+/// Python: self.pending = {} keyed by message bytes; each unique physical transmission gets a group.
 pub struct MlatTracker {
-    /// Buffered messages: ICAO -> (timestamp_group_start, MessageGroup)
-    groups: HashMap<u32, MessageGroup>,
+    /// Buffered messages: message_bytes -> MessageGroup
+    /// Python: self.pending[message] = MessageGroup(message=message, first_seen=now)
+    pending: HashMap<Vec<u8>, MessageGroup>,
 }
 
 impl MlatTracker {
     /// Create a new MLAT tracker
     pub fn new() -> Self {
         MlatTracker {
-            groups: HashMap::new(),
+            pending: HashMap::new(),
         }
     }
     
+    /// Number of pending groups
+    pub fn pending_count(&self) -> usize {
+        self.pending.len()
+    }
+
     /// Process a message from a receiver.
-    /// Buffers the message; does not resolve immediately. Returns Delayed(icao) when the group
-    /// should be resolved after MLAT_DELAY (Python: cohort with loop.call_later(MLAT_DELAY, _process)).
+    /// Python: receiver_mlat. Uses message bytes as key (not ICAO).
+    /// Multiple receivers reporting the same physical message get added to the same group.
+    /// Returns Delayed(message_bytes) for new groups so coordinator can schedule resolution.
     pub fn process_message(
         &mut self,
         receiver_id: usize,
         message: Vec<u8>,
         timestamp: f64,
-        utc: f64,
-        icao: u32,
-        _receivers: &HashMap<usize, crate::receiver::Receiver>,
-        _tracker: &mut crate::tracker::Tracker,
-        _clock_tracker: &crate::clocktrack::ClockTracker,
     ) -> Option<MlatAction> {
-        let mut process_now = false;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
 
-        // Get or create group for this ICAO
-
-        if let Some(group) = self.groups.get_mut(&icao) {
-            // Check if this message belongs to current group (within 2ms window)
-            // Python: "if 0 <= timestamp - group.first_seen <= 0.002"
-            if (utc - group.first_seen).abs() < 2e-3 {
-                 group.add_copy(receiver_id, timestamp, utc);
-                 process_now = true;
-            } else {
-                // New group needed. In a full implementation we'd probably want to
-                // ensure the old group is processed or discarded properly.
-                // For now, valid assumption is that if we have a large gap, the old group is done.
+        // Python: group = self.pending.get(message)
+        if let Some(group) = self.pending.get_mut(&message) {
+            // Existing group: add this receiver's copy
+            // Python: group.receivers.add(receiver); group.copies.append((receiver, timestamp, now))
+            let is_new_receiver = !group.receivers.contains(&receiver_id);
+            group.receivers.insert(receiver_id);
+            if group.copies.len() < MAX_GROUP {
+                group.copies.push(MessageCopy {
+                    receiver_id,
+                    timestamp,
+                    utc: now,
+                });
             }
-        }
-        
-        // If not added to existing group, or if we need to start a new one
-        if !process_now && !self.groups.contains_key(&icao) {
-            let mut group = MessageGroup::new(message, utc);
-            group.add_copy(receiver_id, timestamp, utc);
-            self.groups.insert(icao, group);
-            process_now = true;
-        } else if !process_now {
-             // Replace with new group
-             let mut group = MessageGroup::new(message, utc);
-             group.add_copy(receiver_id, timestamp, utc);
-             self.groups.insert(icao, group);
-             process_now = true;
+            if is_new_receiver {
+                static MATCH_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+                let n = MATCH_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if n < 5 || n % 500 == 0 {
+                    eprintln!("mlattrack: MATCH! msg_len={} receivers={} copies={} (#{}))", message.len(), group.receivers.len(), group.copies.len(), n);
+                }
+            }
+            // Only schedule resolution when we have at least 2 receivers (avoid ts_map<4 / single-receiver fails)
+            if is_new_receiver && group.receivers.len() >= 2 {
+                return Some(MlatAction::Delayed(message.clone()));
+            }
+            return None;
         }
 
-        // Python: resolution happens in cohort._process() after MLAT_DELAY. Return Delayed(icao)
-        // so coordinator can add to cohort and schedule processing.
-        if process_now {
-            return Some(MlatAction::Delayed(icao));
+        // New group for this message (single receiver – do not schedule yet; wait for 2nd receiver)
+        // Python: group = self.pending[message] = MessageGroup(message=message, first_seen=now)
+        let mut group = MessageGroup::new(message.clone(), now);
+        group.receivers.insert(receiver_id);
+        group.copies.push(MessageCopy {
+            receiver_id,
+            timestamp,
+            utc: now,
+        });
+        self.pending.insert(message.clone(), group);
+
+        static NEW_GROUP_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = NEW_GROUP_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n < 3 || n % 5000 == 0 {
+            eprintln!("mlattrack: new group msg_len={} pending={} (#{}))", message.len(), self.pending.len(), n);
         }
+
+        // Don't schedule yet – schedule when 2nd receiver adds (see existing-group path above)
         None
     }
 
-    /// Resolve a single ICAO's pending group after cohort delay (Python: _resolve called from cohort._process).
-    /// Removes the group from pending (Python: del self.pending[group.message]); returns Some(MlatResult) if resolved.
+    /// Resolve a pending group for the given ICAO (cohort delivers icaos; we find one matching message).
+    /// Python: _resolve(group) called from cohort._process() for each icao in cohort.
     pub fn try_resolve_pending(
         &mut self,
         icao: u32,
         receivers: &HashMap<usize, crate::receiver::Receiver>,
-        aircraft: &mut crate::tracker::TrackedAircraft,
+        tracker: &mut crate::tracker::Tracker,
         clock_tracker: &crate::clocktrack::ClockTracker,
         now: f64,
     ) -> Option<MlatResult> {
-        let group = self.groups.remove(&icao)?;
+        let key = self.pending.iter().find_map(|(k, _)| {
+            crate::modes::message::decode(k).and_then(|m| {
+                if m.as_trait().address() == icao {
+                    Some(k.clone())
+                } else {
+                    None
+                }
+            })
+        })?;
+        self.try_resolve_pending_by_message(&key, receivers, clock_tracker, tracker, now)
+    }
+
+    /// Resolve a pending group by message key after cohort delay.
+    /// Python: _resolve(group) called from cohort._process(), del self.pending[group.message]
+    pub fn try_resolve_pending_by_message(
+        &mut self,
+        message_key: &[u8],
+        receivers: &HashMap<usize, crate::receiver::Receiver>,
+        clock_tracker: &crate::clocktrack::ClockTracker,
+        tracker: &mut crate::tracker::Tracker,
+        now: f64,
+    ) -> Option<MlatResult> {
+        let group = self.pending.remove(message_key)?;
+
+        static RESOLVE_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = RESOLVE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let rcvrs = group.receivers.len();
+        let cps = group.copies.len();
+        if n < 5 || n % 2000 == 0 || rcvrs >= 3 {
+            eprintln!("mlattrack: try_resolve copies={} receivers={} age={:.3}s msg_key_len={} (#{}))",
+                cps, rcvrs, now - group.first_seen, message_key.len(), n);
+        }
+
+        // Python: less than 3 messages -> no go
+        if cps < 3 {
+            return None;
+        }
+
+        // Decode message to get aircraft address
+        let decoded = crate::modes::message::decode(&group.message)?;
+        let traj = decoded.as_trait();
+        let icao = traj.address();
+
+        let aircraft = match tracker.get_mut(icao) {
+            Some(a) => a,
+            None => return None,
+        };
+        aircraft.seen = now;
+        aircraft.mlat_message_count += 1;
+
+        // Update aircraft metadata from message using trait methods
+        let traj_ref = decoded.as_trait();
+        if let Some(alt) = traj_ref.altitude() {
+            aircraft.altitude = Some(alt.into());
+            aircraft.last_altitude_time = Some(group.first_seen);
+        }
+        if let Some(sq) = traj_ref.squawk() {
+            aircraft.squawk = u16::from_str_radix(sq, 8).ok().or_else(|| sq.parse().ok());
+        }
+        if let Some(cs) = traj_ref.callsign() {
+            aircraft.callsign = Some(cs.to_string());
+        }
+
+        // Python: check resolve interval (don't resolve too frequently)
+        // NOTE: resolve() also checks this, so we do it HERE and let resolve() skip its check.
+        if now - aircraft.last_resolve_attempt < RESOLVE_INTERVAL {
+            static RI_BLOCKED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let b = RI_BLOCKED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if rcvrs >= 3 && (b < 10 || b % 1000 == 0) {
+                eprintln!("RESOLVE_INTERVAL blocked: icao={:06x} rcvrs={} copies={} age={:.3}s (#{}))",
+                    icao, rcvrs, cps, now - group.first_seen, b);
+            }
+            return None;
+        }
+        // Don't set last_resolve_attempt here; let resolve() set it after successful resolution.
+
         let result = resolve(&group, receivers, aircraft, clock_tracker, now)?;
+        // Verify aircraft state was updated
+        eprintln!("try_resolve: RESULT icao={:06x} mlat_result_count={} has_last_pos={} has_last_time={}",
+            icao, aircraft.mlat_result_count,
+            aircraft.last_result_position.is_some(),
+            aircraft.last_result_time.is_some());
         Some(result)
+    }
+
+    /// Get receiver count for a pending group (for sorting cohort by best groups first).
+    pub fn pending_receiver_count(&self, msg_key: &[u8]) -> usize {
+        self.pending.get(msg_key).map(|g| g.receivers.len()).unwrap_or(0)
+    }
+
+    /// Clean up stale pending groups (older than 5 seconds)
+    pub fn cleanup_stale(&mut self, now: f64) {
+        self.pending.retain(|_, group| now - group.first_seen < 5.0);
     }
 }
 
@@ -893,11 +1068,11 @@ mod tests {
         
         let r1 = Receiver::new(
             1, "r1".to_string(), None, "dump1090",
-            [37.0, -122.0, 0.0], false, "r1".to_string(), 0.0
+            [37.0, -122.0, 0.0], false, "r1".to_string(), 0.0, false
         );
         let r2 = Receiver::new(
             2, "r2".to_string(), None, "dump1090",
-            [38.0, -122.0, 0.0], false, "r2".to_string(), 0.0
+            [38.0, -122.0, 0.0], false, "r2".to_string(), 0.0, false
         );
         
         receivers.insert(1, r1);
